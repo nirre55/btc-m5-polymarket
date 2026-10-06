@@ -242,7 +242,8 @@ Pour activer **soi-même** le réel :
    `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE` reste compatible en
    option. Un trio partiel ou deux alias contradictoires est refusé. Ne pas coller
    les secrets dans un chat, les versionner ou les afficher en logs.
-3. Définir des plafonds personnels explicites pour les quatre limites obligatoires,
+3. Définir des plafonds personnels explicites pour les quatre limites, ou choisir
+   explicitement `use_available_balance=true` pour fonctionner avec le solde disponible,
    choisir la politique de contradiction et la durée d'ordre. `max_open_orders`
    doit être entier. Mettre `mode="live"` et `enable_live=true` dans le fichier local.
 4. Dans l'environnement de lancement, définir volontairement
