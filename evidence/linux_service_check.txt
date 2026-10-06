@@ -1,0 +1,2 @@
+Linux SIGTERM cleanup, fcntl lock, stale-stop reset, persistent HALT: OK
+systemd unit directives: OK (executable substituted; VPS installation untested)

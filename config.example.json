@@ -1,0 +1,15 @@
+{
+  "mode": "prepare",
+  "poll_seconds": 15,
+  "horizon_hours": 26,
+  "requests_per_cycle": 16,
+  "max_book_age_seconds": 30,
+  "conflict_policy": "both",
+  "order_type": "GTD",
+  "max_order_cost": null,
+  "max_total_committed_cost": null,
+  "max_daily_committed_cost": null,
+  "max_open_orders": null,
+  "fee_reserve_fraction": "0.10",
+  "enable_live": false
+}

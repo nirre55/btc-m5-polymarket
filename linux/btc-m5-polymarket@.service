@@ -1,0 +1,29 @@
+[Unit]
+Description=BTC M5 Polymarket (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=polymarket-bot
+Group=polymarket-bot
+WorkingDirectory=/opt/btc-m5-polymarket
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/btc-m5-polymarket/credentials.env
+ExecStart=/opt/btc-m5-polymarket/.venv/bin/python /opt/btc-m5-polymarket/bot.py run --mode %i --config /etc/btc-m5-polymarket/config.local.json
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/btc-m5-polymarket/state_%i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

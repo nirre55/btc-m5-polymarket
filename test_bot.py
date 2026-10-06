@@ -1,0 +1,439 @@
+import ast
+from dataclasses import fields
+from datetime import datetime, timezone
+from decimal import Decimal
+import inspect
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+
+import bot
+from engine import connect, initialize, schedule, intents, save, Engine, position, apply_reconciliation, exposure_ok, phase
+from frozen_calendar import load_rules, matches, next_activation, TZ, calendar_values
+from public_api import quote, validate_market, official_winner
+from reporting import report
+
+D=Decimal
+ROOT=Path(__file__).resolve().parent
+NOW=int(datetime(2026,10,6,13,40,tzinfo=timezone.utc).timestamp())
+OPEN=NOW+300
+
+
+def market(opening=OPEN):
+    iso=lambda t:datetime.fromtimestamp(t,timezone.utc).isoformat()
+    return {'slug':f'btc-updown-5m-{opening}','conditionId':'condition','eventStartTime':iso(opening),
+            'endDate':iso(opening+300),'startDate':iso(opening-86400),
+            'outcomes':'["Up","Down"]','clobTokenIds':'["up","down"]','version':'v1',
+            'resolutionSource':'https://data.chain.link/streams/btc-usd-twap-60s-streams',
+            'description':'Up if Chainlink TWAP is greater than or equal to reference.',
+            'active':True,'acceptingOrders':True,'enableOrderBook':True,'closed':False}
+
+
+def book(token='up',now=NOW):
+    return {'asset_id':token,'market':'condition','timestamp':str(now*1000),
+            'tick_size':'0.01','min_order_size':'5','neg_risk':False,
+            'asks':[{'price':'0.52','size':'20'},{'price':'0.50','size':'2'}]}
+
+
+class FakeAPI:
+    def __init__(self):
+        self.t=NOW;self.uncertainty=1;self.m=market();self.b=book();self.winner=None
+    def now(self): return self.t
+    def sync(self): return self.t
+    def market(self,opening): return self.m if opening==OPEN else None
+    def book(self,token): return {**self.b,'asset_id':token,'timestamp':str(self.t*1000)}
+    def clob(self,cid):
+        return {'condition_id':'condition','market_slug':self.m['slug'],'accepting_orders':True,
+                'closed':bool(self.winner),'tokens':[{'token_id':t,'outcome':o,'winner':self.winner==o}
+                     for t,o in [('up','Up'),('down','Down')]]}
+    def binance(self,opening): return [[opening*1000,'100','100','100','100','0',(opening+300)*1000-1]]
+
+
+class FakeAdapter:
+    def __init__(self): self.signs=0;self.posts=0;self.ambiguous=False;self.read={'status':'LIVE','matched_qty':'0','fills':[]}
+    def sign(self,i): self.signs+=1;return object(),'oid'
+    def submit(self,signed):
+        self.posts+=1
+        if self.ambiguous: raise TimeoutError()
+        return {'ok':True,'order_id':'oid','status':'live','trade_ids':[]}
+    def reconcile(self,i): return self.read
+
+
+class TestFrozen(unittest.TestCase):
+    def test_fresh_database_cannot_accept_changed_selection(self):
+        with tempfile.TemporaryDirectory() as folder, patch('bot.load_rules',return_value=([], 'changed')):
+            with self.assertRaises(ValueError): bot.open_db(Path(folder),bot.configuration(mode='prepare'))
+            self.assertFalse((Path(folder)/'bot.sqlite3').exists())
+    def test_exact_567_and_byte_provenance(self):
+        rules,digest=load_rules()
+        self.assertEqual(len(rules),567)
+        self.assertEqual(digest,bot.FROZEN_SHA256)
+        original=ROOT.parent.parent/'results/BTCUSDT_M5_DRYRUN_HANDOFF/selected_rules.json'
+        if original.exists():
+            self.assertEqual((ROOT/'selected_rules.json').read_bytes(),original.read_bytes())
+        self.assertEqual(sum('classement_m5_toutes' in r['cohorts'] for r in rules),500)
+        self.assertEqual(sum('m5_min100_taux60' in r['cohorts'] for r in rules),67)
+
+    def test_calendar_functions_identical_to_dryrun(self):
+        original=ROOT.parent/'BTCUSDT_M5_CALENDAR_DRYRUN/bot.py'
+        if not original.exists():
+            self.skipTest('source comparison requires the original research workspace; frozen SHA checked independently')
+        old=ast.parse(original.read_text(encoding='utf-8'))
+        new=ast.parse((ROOT/'frozen_calendar.py').read_text(encoding='utf-8'))
+        for name in ['calendar_values','matches','next_activation','load_rules']:
+            get=lambda tree:ast.dump(next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name==name))
+            self.assertEqual(get(old),get(new))
+
+    def test_dst_fall_two_distinct_occurrences(self):
+        r={'slot':18,'calendar':{}}
+        a=int(datetime(2026,11,1,5,29,tzinfo=timezone.utc).timestamp()*1000)
+        first=next_activation(r,a);second=next_activation(r,first)
+        self.assertEqual(second-first,3600000)
+        self.assertTrue(matches(r,first));self.assertTrue(matches(r,second))
+
+    def test_dst_spring_nonexistent_skipped(self):
+        r={'slot':30,'calendar':{}}
+        a=int(datetime(2027,3,14,0,0,tzinfo=TZ).timestamp()*1000)
+        result=next_activation(r,a)
+        self.assertEqual(datetime.fromtimestamp(result/1000,TZ).day,15)
+
+    def test_calendar_numeric_filters(self):
+        d=datetime(2026,10,30,13,40,tzinfo=TZ)
+        v=calendar_values(d)
+        self.assertEqual(v,{'jour_semaine':4,'jour_mois':30,'mois':10,'trimestre':4,
+                            'rang_mois':5,'distance_fin_mois':1,'dernier_jour_semaine':1,'weekend':0})
+        r={'slot':164,'calendar':v}
+        self.assertTrue(matches(r,int(d.timestamp()*1000)))
+        r['calendar']={**v,'distance_fin_mois':0}
+        self.assertFalse(matches(r,int(d.timestamp()*1000)))
+
+
+class TestPublic(unittest.TestCase):
+    def test_window_and_creation_are_distinct(self):
+        self.assertEqual(validate_market(market(),OPEN),{'Up':'up','Down':'down'})
+    def test_wrong_window_rejected(self):
+        m=market();m['endDate']=market(OPEN+300)['endDate']
+        with self.assertRaises(ValueError): validate_market(m,OPEN)
+    def test_wrong_slug_rejected(self):
+        with self.assertRaises(ValueError): validate_market(market(OPEN-300),OPEN)
+    def test_v2_outcome_identifier(self):
+        m=market();m.update(version='v2',positionIds=['pos-up','pos-down'])
+        self.assertEqual(validate_market(m,OPEN)['Down'],'pos-down')
+    def test_best_ask_unsorted_and_minimum(self):
+        p,s,t,a=quote(book(),'up','condition',D(NOW))
+        self.assertEqual((p,s,t),(D('.50'),D('5.00'),D('.01')))
+    def test_round_tick_up_and_minimum_up(self):
+        b=book();b['asks']=[{'price':'.503','size':'2'}];b['min_order_size']='5.001'
+        p,s,_,_=quote(b,'up','condition',D(NOW))
+        self.assertEqual((p,s),(D('.51'),D('5.01')))
+    def test_stale_future_and_empty_books(self):
+        for b in [{**book(),'timestamp':str((NOW-60)*1000)},
+                  {**book(),'timestamp':str((NOW+3)*1000)}, {**book(),'asks':[]}]:
+            with self.assertRaises(ValueError): quote(b,'up','condition',D(NOW))
+    def test_wrong_token_or_condition(self):
+        for token,cid in [('down','condition'),('up','other')]:
+            with self.assertRaises(ValueError): quote(book(),token,cid,D(NOW))
+    def test_nan_and_bad_tick_rejected(self):
+        for b in [{**book(),'min_order_size':'NaN'},{**book(),'tick_size':'0.02'},
+                  {**book(),'asks':[{'price':'NaN','size':'2'}]}]:
+            with self.assertRaises(ValueError): quote(b,'up','condition',D(NOW))
+    def test_resolution_requires_closed_and_one_winner(self):
+        c={'closed':False,'tokens':[{'outcome':'Up','winner':True}]}
+        self.assertIsNone(official_winner(c));c['closed']=True
+        self.assertEqual(official_winner(c),'Up')
+        c['tokens'].append({'outcome':'Down','winner':True})
+        self.assertIsNone(official_winner(c))
+
+
+class TestEngine(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.folder=Path(self.temp.name)
+        self.db=connect(self.folder/'test.sqlite3');self.api=FakeAPI()
+        d=datetime.fromtimestamp(OPEN,TZ);slot=d.hour*12+d.minute//5
+        self.rules=[{'id':'a','prediction':'V','slot':slot,'calendar':{},'cohorts':['classement_m5_toutes']},
+                    {'id':'b','prediction':'V','slot':slot,'calendar':{},'cohorts':['m5_min100_taux60']},
+                    {'id':'c','prediction':'R','slot':slot,'calendar':{},'cohorts':['classement_m5_toutes']}]
+        self.config=bot.configuration(mode='prepare')
+        initialize(self.db,self.rules,'digest','prepare')
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder)
+        schedule(self.db,self.rules,NOW,self.config)
+    def tearDown(self): self.db.close();self.temp.cleanup()
+    def one(self,direction='Up'): return next(i for i in intents(self.db) if i['opening']==OPEN and i['direction']==direction)
+    def prepared(self):
+        i=self.one()
+        with self.db: self.engine.prepare(i,NOW)
+        return i
+    def live(self):
+        self.config.update(mode='live',max_order_cost='10',max_total_committed_cost='100',
+                           max_daily_committed_cost='100',max_open_orders=10)
+        adapter=FakeAdapter();self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter)
+        return adapter
+    def test_grouping_and_no_hidden_vote(self):
+        rows=[i for i in intents(self.db) if i['opening']==OPEN]
+        self.assertEqual(len(rows),2);self.assertTrue(all(i['conflict'] for i in rows))
+        self.assertEqual(self.db.execute('SELECT count(*) FROM links WHERE intent_id=?',(self.one()['id'],)).fetchone()[0],2)
+    def test_schedule_idempotence(self):
+        before=len(intents(self.db));schedule(self.db,self.rules,NOW,self.config)
+        self.assertEqual(len(intents(self.db)),before)
+    def test_future_preparation_and_zero_position(self):
+        i=self.prepared();self.assertEqual(i['state'],'PREPARED');self.assertLess(i['prepared_at'],OPEN)
+        self.assertEqual(position(self.db,i)['quantity'],'0');self.assertIsNone(position(self.db,i)['result'])
+    def test_no_current_market_substitution(self):
+        self.api.m=None;i=self.one()
+        with self.db: self.engine.prepare(i,NOW)
+        self.assertEqual(i['state'],'WAITING');self.assertNotIn('price',i)
+        self.assertIn('not_listed',i['last_error'])
+    def test_missing_future_retry_then_prepare(self):
+        self.api.m=None;i=self.one()
+        with self.db: self.engine.prepare(i,NOW)
+        self.api.m=market()
+        with self.db: self.engine.prepare(i,NOW+20)
+        self.assertEqual(i['state'],'PREPARED')
+    def test_never_prepare_after_opening(self):
+        i=self.one();self.api.t=OPEN
+        with self.db: self.engine.prepare(i,OPEN)
+        self.assertEqual(i['state'],'MISSED');self.assertNotIn('price',i)
+    def test_no_reprice_on_followup(self):
+        i=self.prepared();initial=i['price'];self.api.b['asks']=[{'price':'.70','size':'50'}]
+        with self.db: self.engine.observe(i,NOW+20)
+        self.assertEqual(i['price'],initial)
+    def test_paper_partial_once_and_expired_remainder(self):
+        self.config['mode']='paper';i=self.one();i['mode']='paper'
+        with self.db: self.engine.prepare(i,NOW)
+        self.assertEqual(i['state'],'PAPER_OPEN');self.assertEqual(position(self.db,i)['quantity'],'2')
+        self.api.t=OPEN+302
+        with self.db: self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'PAPER_EXPIRED_REMAINDER');self.assertEqual(position(self.db,i)['quantity'],'2')
+        self.assertIsNone(position(self.db,i)['result']);self.assertEqual(i['binance']['hypothesis_result'],'LOSS')
+        self.api.winner='Up'
+        with self.db: self.engine.observe(i,self.api.t+30)
+        self.assertEqual(position(self.db,i)['result'],'WIN')
+    def test_binance_doji_does_not_determine_polymarket(self):
+        i=self.prepared();self.api.t=OPEN+302;self.api.winner='Up'
+        with self.db: self.engine.observe(i,self.api.t)
+        self.assertEqual(i['winner'],'Up');self.assertEqual(i['binance']['color'],'DOJI')
+        self.assertEqual(i['binance']['hypothesis_result'],'LOSS');self.assertIsNone(position(self.db,i)['result'])
+    def test_simulated_and_real_bases_cannot_mix(self):
+        with self.assertRaises(ValueError): initialize(self.db,self.rules,'digest','live')
+    def test_selection_mutation_rejected(self):
+        with self.assertRaises(ValueError): initialize(self.db,self.rules,'other','prepare')
+    def test_public_modes_reject_execution_adapter(self):
+        with self.assertRaises(ValueError): Engine(self.db,self.rules,self.config,self.api,self.folder,FakeAdapter())
+    def test_halt_blocks_live_post(self):
+        i=self.prepared();adapter=self.live();(self.folder/'HALT').touch()
+        self.engine.submit(i,NOW);self.assertEqual(adapter.posts,0);self.assertEqual(adapter.signs,0)
+    def test_sigterm_stop_callback_blocks_new_orders(self):
+        i=self.prepared();adapter=self.live()
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter,stop_requested=lambda:True)
+        self.engine.submit(i,NOW)
+        self.assertEqual(adapter.posts,0);self.assertEqual(adapter.signs,0)
+    def test_cooperative_stop_file_blocks_new_orders(self):
+        i=self.prepared();adapter=self.live();(self.folder/'stop.request').touch()
+        self.engine.submit(i,NOW)
+        self.assertEqual(adapter.posts,0);self.assertEqual(adapter.signs,0)
+    def test_ambiguous_submission_no_retry_after_restart(self):
+        i=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(i,NOW)
+        self.assertEqual(i['state'],'UNKNOWN');self.assertEqual(adapter.posts,1)
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter)
+        second=self.one('Down')
+        with self.db: self.engine.prepare(second,NOW)
+        self.engine.submit(second,NOW)
+        self.assertEqual(adapter.posts,1);self.assertIn('ambiguous',second['last_error'])
+    def test_crash_sending_recovered_as_unknown(self):
+        i=self.prepared()
+        with self.db: save(self.db,i,'SENDING')
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder)
+        self.assertEqual(self.one()['state'],'UNKNOWN')
+    def test_exposure_no_arbitrary_budget(self):
+        i=self.prepared();self.config['mode']='live'
+        self.assertEqual(exposure_ok(self.db,i,self.config,NOW),(False,'live_limits_required'))
+        self.config.update(max_order_cost='1',max_total_committed_cost='10',max_daily_committed_cost='10',max_open_orders=1)
+        self.assertEqual(exposure_ok(self.db,i,self.config,NOW)[1],'max_order_cost')
+    def test_shared_exposure_counts_both_directions(self):
+        first=self.prepared();first.update(committed_cost='2.75',committed_at=NOW)
+        with self.db: save(self.db,first,'LIVE')
+        second=self.one('Down')
+        with self.db: self.engine.prepare(second,NOW)
+        self.config.update(mode='live',max_order_cost='10',max_total_committed_cost='4',
+                           max_daily_committed_cost='100',max_open_orders=10)
+        self.assertEqual(exposure_ok(self.db,second,self.config,NOW)[1],'max_total_committed_cost')
+    def test_restart_preserves_initial_quote_and_links(self):
+        i=self.prepared();initial=i['price'];identity=i['id']
+        self.db.close();self.db=connect(self.folder/'test.sqlite3')
+        initialize(self.db,self.rules,'digest','prepare')
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder)
+        self.assertEqual(self.one()['price'],initial);self.assertEqual(self.one()['id'],identity)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM links WHERE intent_id=?',(identity,)).fetchone()[0],2)
+    def test_canceled_partial_position_survives_resolution(self):
+        i=self.prepared();adapter=self.live();i['mode']='live';i['order_id']='oid'
+        with self.db: save(self.db,i,'LIVE')
+        adapter.read={'status':'CANCELED_MARKET_RESOLVED','matched_qty':'2',
+                      'fills':[{'id':'t1','leg':'maker','qty':'2','price':'.50','status':'CONFIRMED'}]}
+        self.api.winner='Down';self.api.t=OPEN+302
+        with self.db: self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'CANCELED_MARKET_RESOLVED')
+        self.assertEqual(position(self.db,i)['quantity'],'2');self.assertEqual(position(self.db,i)['result'],'LOSS')
+    def test_gtc_does_not_claim_local_expiration(self):
+        self.config.update(mode='paper',order_type='GTC');i=self.one();i['mode']='paper'
+        with self.db: self.engine.prepare(i,NOW)
+        self.api.t=OPEN+302
+        with self.db: self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'PAPER_OPEN')
+    def test_overfilled_response_rolled_back(self):
+        i=self.prepared();r={'status':'LIVE','matched_qty':'5','fills':[
+            {'id':'t1','leg':'taker','qty':'3','price':'.5','status':'CONFIRMED'},
+            {'id':'t2','leg':'taker','qty':'3','price':'.5','status':'CONFIRMED'}]}
+        with self.assertRaises(ValueError):
+            with self.db: apply_reconciliation(self.db,i,r)
+        self.assertEqual(position(self.db,i)['quantity'],'0')
+    def test_confirmed_partial_fill_idempotent_and_pending_distinct(self):
+        i=self.prepared();i['mode']='live'
+        f={'id':'t1','leg':'taker','qty':'2','price':'.49','status':'TRADE_STATUS_MATCHED'}
+        r={'status':'LIVE','matched_qty':'2','fills':[f]}
+        with self.db: apply_reconciliation(self.db,i,r)
+        self.assertEqual(position(self.db,i)['quantity'],'0')
+        f['status']='TRADE_STATUS_CONFIRMED';i['winner']='Up'
+        with self.db: apply_reconciliation(self.db,i,r);apply_reconciliation(self.db,i,r)
+        self.assertEqual(position(self.db,i)['quantity'],'2');self.assertEqual(position(self.db,i)['result'],'WIN')
+        self.assertEqual(self.db.execute('SELECT count(*) FROM fills').fetchone()[0],1)
+    def test_confirmed_trade_cannot_regress(self):
+        i=self.prepared();f={'id':'t1','leg':'taker','qty':'2','price':'.5','status':'CONFIRMED'}
+        r={'status':'LIVE','matched_qty':'2','fills':[f]}
+        with self.db: apply_reconciliation(self.db,i,r)
+        f['status']='FAILED'
+        with self.assertRaises(ValueError):
+            with self.db: apply_reconciliation(self.db,i,r)
+    def test_phase_is_not_order_or_position(self):
+        i=self.prepared();self.assertEqual(phase(i,NOW),'BEFORE_START')
+        self.assertEqual(phase(i,OPEN),'IN_PROGRESS')
+        self.assertEqual(phase(i,OPEN+300),'ENDED_AWAITING_OFFICIAL_RESOLUTION')
+    def test_conflict_skip_both_policy(self):
+        other=connect(self.folder/'skip.sqlite3');initialize(other,self.rules,'digest','prepare')
+        self.config['conflict_policy']='skip_both';schedule(other,self.rules,NOW,self.config)
+        self.assertTrue(all(i['state']=='CONFLICT_SKIPPED' for i in intents(other)))
+        other.close()
+    def test_report_n_zero_unavailable_and_frozen_histories(self):
+        rules,_=load_rules();db=connect(self.folder/'full.sqlite3');initialize(db,rules,'digest','prepare')
+        summary=report(db,rules,self.folder,self.config,False)
+        self.assertEqual(summary['confirmed_or_simulated_positions'],0)
+        data=json.loads((self.folder/'report.json').read_text(encoding='utf-8'))
+        self.assertTrue(all(r['winrate'] is None for r in data['rules']))
+        self.assertEqual(data['rules'][0]['historical'],rules[0]['historical']);db.close()
+
+
+class TestSDKOffline(unittest.TestCase):
+    def test_four_variable_configuration_derives_credentials(self):
+        from execution import credential_options
+        options,kind=credential_options({'POLYMARKET_PRIVATE_KEY':'fixture-key','POLYMARKET_FUNDER':'fixture-wallet',
+                         'POLYMARKET_SIGNATURE_TYPE':'3','POLYMARKET_API_URL':'https://clob.polymarket.com'})
+        self.assertEqual(options,{'private_key':'fixture-key','wallet':'fixture-wallet'})
+        self.assertEqual(kind,3);self.assertNotIn('credentials',options)
+    def test_legacy_manual_credentials_still_supported(self):
+        from execution import credential_options
+        options,kind=credential_options({'POLY_PRIVATE_KEY':'fixture-key','POLY_WALLET_ADDRESS':'fixture-wallet',
+                        'POLY_API_KEY':'fixture-api','POLY_API_SECRET':'fixture-secret','POLY_API_PASSPHRASE':'fixture-pass'})
+        self.assertEqual(options['credentials'].key,'fixture-api');self.assertIsNone(kind)
+    def test_configuration_rejects_conflicts_partial_trio_and_other_endpoint(self):
+        from execution import credential_options
+        base={'POLYMARKET_PRIVATE_KEY':'fixture-key','POLYMARKET_FUNDER':'fixture-wallet'}
+        for override in [{'POLY_PRIVATE_KEY':'other-key'},{'POLY_API_KEY':'partial'},
+                         {'POLYMARKET_API_URL':'https://example.invalid'},{'POLYMARKET_SIGNATURE_TYPE':'4'}]:
+            with self.assertRaises(RuntimeError): credential_options({**base,**override})
+    def test_bootstrap_is_mocked_and_checks_deposit_wallet_type(self):
+        from execution import LiveAdapter
+        from polymarket import SecureClient
+        from unittest.mock import MagicMock
+        env={'POLY_ENABLE_LIVE':'I_ACCEPT_LIVE_ORDERS','POLYMARKET_PRIVATE_KEY':'fixture-key',
+             'POLYMARKET_FUNDER':'fixture-wallet','POLYMARKET_SIGNATURE_TYPE':'3'}
+        fake=MagicMock();fake.wallet_type='DEPOSIT_WALLET'
+        with patch('execution.os.environ',env),patch.object(SecureClient,'create',return_value=fake) as create:
+            adapter=LiveAdapter({'mode':'live','enable_live':True})
+            self.assertIs(adapter.client,fake)
+            self.assertEqual(create.call_args.kwargs,{'private_key':'fixture-key','wallet':'fixture-wallet'})
+            fake.create_limit_order.assert_not_called();fake.post_order.assert_not_called()
+    def test_bootstrap_wallet_type_mismatch_closes_without_orders(self):
+        from execution import LiveAdapter
+        from polymarket import SecureClient
+        from unittest.mock import MagicMock
+        env={'POLY_ENABLE_LIVE':'I_ACCEPT_LIVE_ORDERS','POLYMARKET_PRIVATE_KEY':'fixture-key',
+             'POLYMARKET_FUNDER':'fixture-wallet','POLYMARKET_SIGNATURE_TYPE':'3'}
+        fake=MagicMock();fake.wallet_type='EOA'
+        with patch('execution.os.environ',env),patch.object(SecureClient,'create',return_value=fake):
+            with self.assertRaises(RuntimeError): LiveAdapter({'mode':'live','enable_live':True})
+        fake.close.assert_called_once();fake.post_order.assert_not_called();fake.create_limit_order.assert_not_called()
+    def test_adapter_maps_taker_and_maker_fills_without_account_access(self):
+        from execution import LiveAdapter
+        intent={'order_id':'oid','token':'up','condition':'condition','price':'.50','size':'5',
+                'trade_ids':['immediate']}
+        order=SimpleNamespace(id='oid',asset_id='up',condition_id='condition',side='BUY',
+                    price=D('.5'),original_size=D('5'),status='LIVE',size_matched=D('3'),associate_trades=['later'])
+        taker=SimpleNamespace(id='immediate',taker_order_id='oid',asset_id='up',side='BUY',size=D('2'),
+                             price=D('.49'),status='CONFIRMED',transaction_hash='tx1')
+        maker=SimpleNamespace(id='later',taker_order_id='other',maker_orders=[SimpleNamespace(
+                    order_id='oid',asset_id='up',side='BUY',matched_amount=D('1'),price=D('.5'))],
+                    status='MATCHED',transaction_hash=None)
+        called=[]
+        def reads(id):
+            called.append(id)
+            return SimpleNamespace(iter_items=lambda:iter([taker if id=='immediate' else maker]))
+        adapter=object.__new__(LiveAdapter)
+        adapter.client=SimpleNamespace(get_order=lambda **kw:order,list_account_trades=reads)
+        result=adapter.reconcile(intent)
+        self.assertEqual(set(called),{'immediate','later'})
+        self.assertEqual(result['matched_qty'],'3')
+        self.assertEqual([(f['leg'],f['qty']) for f in result['fills']],[('taker','2'),('maker','1')])
+    def test_adapter_rejects_other_market_without_trade_reads(self):
+        from execution import LiveAdapter
+        adapter=object.__new__(LiveAdapter)
+        adapter.client=SimpleNamespace(get_order=lambda **kw:SimpleNamespace(asset_id='down',side='BUY'))
+        with self.assertRaises(ValueError): adapter.reconcile({'order_id':'oid','token':'up'})
+    def test_adapter_rejected_response_never_creates_position(self):
+        from execution import LiveAdapter
+        from polymarket.models.clob.order_response import RejectedOrder
+        adapter=object.__new__(LiveAdapter)
+        adapter.client=SimpleNamespace(post_order=lambda x:RejectedOrder(code='not_enough_balance',message='fixture'))
+        result=adapter.submit(object())
+        self.assertFalse(result['ok']);self.assertIsNone(result['order_id']);self.assertEqual(result['trade_ids'],[])
+    def test_live_default_rejected_before_secret_access(self):
+        from execution import LiveAdapter
+        with self.assertRaises(RuntimeError): LiveAdapter(bot.configuration(mode='prepare'))
+        with patch.dict('os.environ',{'POLY_ENABLE_LIVE':''}):
+            with self.assertRaises(ValueError): bot.configuration(mode='live')
+    def test_pinned_sdk_interfaces_without_authentication_or_signing(self):
+        import importlib.metadata
+        from polymarket import SecureClient, SignedOrder, ApiKeyCreds
+        self.assertEqual(importlib.metadata.version('polymarket-client'),'0.12.0')
+        for name in ['create_limit_order','post_order','get_order','list_account_trades']:
+            self.assertTrue(callable(getattr(SecureClient,name)))
+        self.assertIn('expiration',inspect.signature(SecureClient.create_limit_order).parameters)
+        self.assertIn('apiKey',ApiKeyCreds.model_fields['key'].validation_alias)
+        self.assertIn('timestamp',{f.name for f in fields(SignedOrder)})
+    def test_order_hash_matches_eip712_without_signing(self):
+        from polymarket import SignedOrder
+        from polymarket.environments import PRODUCTION
+        from polymarket._internal.actions.orders.types import UnsignedOrder
+        from polymarket._internal.actions.orders.context import resolve_order_exchange_address
+        from polymarket._internal.protocol import is_v2_position_id
+        from polymarket._internal.actions.orders.typed_data import _build_standard_typed_data
+        from eth_account.messages import encode_typed_data, _hash_eip191_message
+        from dataclasses import asdict
+        from execution import order_identity
+        config=PRODUCTION._config
+        addr='0x'+'11'*20;zero='0x'+'00'*32
+        signed=SignedOrder(builder=zero,expiration=OPEN+360,maker=addr,maker_amount=2500000,
+          metadata=zero,order_type='GTD',salt=123,side='BUY',signature='0x',signature_type=0,
+          signer=addr,taker_amount=5000000,timestamp=NOW*1000,token_id='123')
+        fake=SimpleNamespace(_ctx=SimpleNamespace(environment_config=config))
+        values=asdict(signed);values.pop('signature');values.pop('post_only')
+        u=UnsignedOrder(**values,chain_id=config.chain_id,
+           exchange_address=resolve_order_exchange_address(config,asset_id='123',neg_risk=False))
+        version='3' if is_v2_position_id('123') else '2'
+        expected='0x'+_hash_eip191_message(encode_typed_data(full_message=_build_standard_typed_data(u,protocol_version=version))).hex()
+        self.assertEqual(order_identity(signed,fake,False),expected)
+
+
+if __name__=='__main__': unittest.main()
