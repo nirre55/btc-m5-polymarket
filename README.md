@@ -49,6 +49,10 @@ de SQLite et conserver ensemble la base et ses éventuels WAL/SHM.
 ## Marché exact et préparation anticipée
 
 Le bot parcourt les créneaux futurs dans un horizon roulant de 72 heures configurable.
+Un marché absent est recherché une fois par heure, avec un dernier contrôle
+60 secondes avant son ouverture. S'il manque encore, il est marqué manqué à
+l'ouverture : aucun achat sur un marché en cours ou passé. Les carnets invalides,
+fonds manquants et positions existantes gardent leurs fréquences distinctes.
 Il interroge exclusivement le slug `btc-updown-5m-<ouverture Unix en secondes>`.
 Il exige `eventStartTime`/`events.startTime` = ouverture et `endDate` = ouverture
 + 300 secondes ; le `startDate` Gamma est une date de création, pas la bougie.

@@ -199,6 +199,23 @@ class TestEngine(unittest.TestCase):
         self.api.m=market()
         with self.db: self.engine.prepare(i,NOW+20)
         self.assertEqual(i['state'],'PREPARED')
+    def test_absent_distant_market_checked_hourly(self):
+        i=self.one();i['opening']=NOW+7200
+        with self.db: self.engine.retry(i,'exact_future_market_not_listed',NOW)
+        self.assertEqual(i['next_check'],NOW+3600)
+    def test_absent_market_gets_one_final_check_before_opening(self):
+        i=self.one();i['opening']=NOW+1800
+        with self.db: self.engine.retry(i,'exact_future_market_not_listed',NOW)
+        self.assertEqual(i['next_check'],i['opening']-60)
+        with self.db: self.engine.retry(i,'exact_future_market_not_listed',i['opening']-60)
+        self.assertEqual(i['next_check'],i['opening'])
+        self.api.t=i['opening']
+        with self.db: self.engine.prepare(i,self.api.t)
+        self.assertEqual(i['state'],'MISSED');self.assertNotIn('price',i)
+    def test_existing_market_errors_do_not_wait_an_hour(self):
+        i=self.one()
+        with self.db: self.engine.retry(i,'not_accepting_orders',NOW)
+        self.assertLess(i['next_check'],NOW+3600)
     def test_never_prepare_after_opening(self):
         i=self.one();self.api.t=OPEN
         with self.db: self.engine.prepare(i,OPEN)

@@ -1,5 +1,10 @@
 # Vérification du 6 octobre 2026
 
+Mise à jour découverte horaire : 73 tests exécutés, un contrôle de source externe
+ignoré dans un clone autonome. Marché absent distant : prochain contrôle à +3600s ;
+dernier contrôle à ouverture moins 60s ; ensuite MISSED sans requête ni ordre
+sur le marché commencé. Les autres erreurs conservent leurs fréquences distinctes.
+
 ## Mise à jour file d'attente / capital
 
 Suite complète : 70 tests (un contrôle de provenance du workspace d'origine

@@ -218,8 +218,15 @@ class Engine:
     def retry(self, i, reason, now):
         i['attempts'] += 1
         i['last_error'] = reason
+        if reason=='exact_future_market_not_listed':
+            # Hourly discovery, with one last chance 60s before opening.
+            # If that check is also negative, wake at opening only to mark MISSED.
+            last_chance=i['opening']-60
+            next_check=min(now+3600,last_chance) if last_chance>now else i['opening']
+            save(self.db,i,next_check=next_check)
+            return
         delay = min(300,15*2**min(i['attempts']-1,5))
-        # Prioritize imminent events without spinning through absent markets.
+        # Other transient failures keep faster retries near imminent events.
         delay = min(delay,max(15,(i['opening']-now)/4)) if i['opening']>now else delay
         save(self.db,i,next_check=now+delay)
 
