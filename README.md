@@ -48,7 +48,7 @@ de SQLite et conserver ensemble la base et ses éventuels WAL/SHM.
 
 ## Marché exact et préparation anticipée
 
-Le bot parcourt les créneaux futurs dans un horizon de 26 heures configurable.
+Le bot parcourt les créneaux futurs dans un horizon roulant de 72 heures configurable.
 Il interroge exclusivement le slug `btc-updown-5m-<ouverture Unix en secondes>`.
 Il exige `eventStartTime`/`events.startTime` = ouverture et `endDate` = ouverture
 + 300 secondes ; le `startDate` Gamma est une date de création, pas la bougie.
@@ -113,11 +113,30 @@ Les paramètres d'exposition sont `max_order_cost`, `max_total_committed_cost`,
 choisi pour l'utilisateur : ils sont `null` en prepare/paper et **tous obligatoires
 en live**. Frais : réserve prudente configurable `fee_reserve_fraction=0.10`,
 incluse dans les engagements, pas une estimation de frais réellement payés.
-Le total est un plafond conservateur sur les engagements depuis la création de
-la base ; il ne recycle pas les règlements ni les refus automatiquement. Le
-plafond quotidien utilise le jour UTC de soumission. Les deux directions partagent
-les mêmes plafonds. Les plafonds concernent cette base, pas les autres bots ou
-ordres du compte ; le plafond du nombre d'ordres doit être un entier.
+Le total plafonne le capital simultanément engagé : ordres en cours, exécutions
+non confirmées et positions non résolues. Une résolution ne libère ce plafond
+qu'après confirmation des fills et fin effective de l'ordre. Un reliquat annulé
+ne conserve que le coût des shares exécutées. Les refus explicites ne consomment
+pas le plafond. `max_open_orders` limite les intentions engagées simultanément,
+y compris les positions remplies non résolues ; il doit être un entier.
+Le plafond quotidien utilise le jour UTC de soumission et ne recycle pas les
+règlements. Les deux directions partagent les mêmes plafonds de cette base.
+
+Avant chaque soumission live, le bot lit le solde collateral et les permissions
+ainsi que tous les ordres BUY ouverts du compte, y compris ceux des autres bots,
+pour déduire leurs réservations. Les engagements locaux absents de la lecture,
+les fills non confirmés et les engagements récents sont réservés prudemment.
+Un montant insuffisant devient `WAITING_FUNDS`, vérifié à nouveau après 30 secondes,
+sans changer le prix initial. Un refus explicite de balance remet également
+l'intention en attente ; une réponse ambiguë reste UNKNOWN et bloque les achats.
+Une lecture indisponible ne permet aucune soumission.
+
+Les créneaux disponibles les plus proches passent d'abord ; un marché absent
+ou un carnet invalide ne bloque pas les autres marchés. Après l'ouverture,
+l'intention non soumise est abandonnée. Le bot ne vend ni n'annule les autres
+positions pour financer un achat. Il s'appuie sur l'auto-redeem activé par
+l'utilisateur et ne lance aucun redeem : seul le cash réellement observé peut
+financer de nouveaux achats. Un gain théorique n'est jamais crédité en avance.
 
 ## Modes, exécutions et résolution
 

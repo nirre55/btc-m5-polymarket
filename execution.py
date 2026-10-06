@@ -4,6 +4,7 @@ SDK pinned: private typed-data helpers are used solely for durable order identit
 No allowance recovery, wallet deployment, transaction or redemption is performed.
 """
 import os
+import time
 from dataclasses import asdict
 from decimal import Decimal
 
@@ -80,12 +81,61 @@ class LiveAdapter:
                     expiration=intent['expiration'] if intent['order_type'] == 'GTD' else None)
         return signed, order_identity(signed, self.client, intent['neg_risk'])
 
+    def funds(self, intent, reservations, fee_reserve):
+        """Read only. No approvals, redemptions or collateral transfers."""
+        from polymarket._internal.actions.orders.context import resolve_order_exchange_address
+        from polymarket._internal.actions.account import build_update_balance_allowance_request
+        from polymarket._internal.wallet import signature_type_for
+        # Refresh the CLOB balance index after deposits/auto-redeem. This is
+        # an authenticated GET, not an on-chain approval or transfer.
+        clock=time.monotonic()
+        if clock-getattr(self,'_last_balance_refresh',float('-inf'))>=30:
+            path,params=build_update_balance_allowance_request(asset_type='COLLATERAL',
+                      signature_type=signature_type_for(self.client.wallet_type))
+            self.client._ctx.secure_clob.get_bytes(path,params=params)
+            self._last_balance_refresh=clock
+        balance=self.client.get_balance_allowance(asset_type='COLLATERAL')
+        spender=str(resolve_order_exchange_address(self.client._ctx.environment_config,
+                    asset_id=intent['token'],neg_risk=intent['neg_risk'])).lower()
+        allowance=next((v for k,v in balance.allowances.items() if k.lower()==spender),0)
+        if balance.balance<0 or allowance<0:
+            raise ValueError('invalid_account_balance')
+        factor=1+Decimal(fee_reserve)
+        reserved=Decimal(0); seen=set()
+        for order in self.client.list_open_orders().iter_items():
+            if order.id in seen:
+                raise ValueError('duplicate_open_order')
+            seen.add(order.id)
+            if not (order.price.is_finite() and 0<order.price<1 and
+                    order.original_size.is_finite() and order.size_matched.is_finite() and
+                    0<=order.size_matched<=order.original_size):
+                raise ValueError('invalid_open_order_amounts')
+            if order.side=='BUY':
+                reserved+=(order.original_size-order.size_matched)*order.price*factor
+        extra=sum((Decimal(x['pending'] if x['order_id'] in seen else x['missing'])
+                   for x in reservations),Decimal(0))
+        cash=Decimal(balance.balance)/Decimal(1000000)
+        approved=Decimal(allowance)/Decimal(1000000)
+        return {'balance':str(cash),'allowance':str(approved),'open_buy_reserved':str(reserved),
+                'local_reserved':str(extra),'available':str(max(Decimal(0),min(cash,approved)-reserved-extra))}
+
     def submit(self, signed):
         # post_order has no automatic allowance recovery in pinned SDK 0.12.0.
-        r = self.client.post_order(signed)
+        from polymarket.errors import RequestRejectedError
+        try:
+            r = self.client.post_order(signed)
+        except RequestRejectedError as e:
+            # Only a definitive HTTP 400 funds rejection is safe to retry.
+            # Never persist SDK exception text: it may include request headers.
+            if e.status==400 and (e.code=='not_enough_balance' or any(x in str(e).lower() for x in
+                    ('not enough balance / allowance','allowance is not enough'))):
+                return {'ok':False,'order_id':None,'status':'REJECTED','trade_ids':[],
+                        'code':'not_enough_balance','retryable_funds':True}
+            raise
         return {'ok':r.ok, 'order_id':r.order_id if r.ok else None,
                 'status':r.status if r.ok else 'REJECTED',
-                'trade_ids':list(r.trade_ids) if r.ok else [], 'code':None if r.ok else r.code}
+                'trade_ids':list(r.trade_ids) if r.ok else [], 'code':None if r.ok else r.code,
+                'retryable_funds':not r.ok and r.code=='not_enough_balance'}
 
     def reconcile(self, intent):
         order = self.client.get_order(order_id=intent['order_id'])

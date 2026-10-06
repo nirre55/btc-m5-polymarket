@@ -36,6 +36,10 @@ n'existent pas encore. Pour une mise à jour, **ne pas recopier les exemples sur
 la configuration ou les secrets existants** ; conserver aussi les dossiers state.
 Le code appartient à root ; seuls les dossiers state sont modifiables par le bot.
 
+La surveillance utilise un horizon roulant de 72 heures. Pour une installation
+existante, modifier seulement `horizon_hours` dans le fichier de configuration
+local, sans recopier les exemples ni remplacer les credentials.
+
 ## Secrets enregistrés une seule fois
 
 ```bash

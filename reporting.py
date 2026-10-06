@@ -8,7 +8,7 @@ import json
 import os
 import time
 
-from engine import intents, meta, position, phase, dumps
+from engine import intents, meta, position, phase, dumps, committed_risk
 from frozen_calendar import TZ, next_activation, GROUPS
 
 
@@ -62,6 +62,8 @@ def report(db, rules, folder, config, alive):
        'contradictory_candles':len({i['opening'] for i in rows if i['conflict']}),
        'confirmed_or_simulated_positions':sum(float(i['position']['quantity'])>0 for i in rows),
        'cohorts':cohorts,'execution_disabled':config['mode']!='live',
+       'active_committed_cost':str(sum((committed_risk(db,i,config) for i in rows),0)),
+       'funds_waiting':sum(i['state']=='WAITING_FUNDS' for i in rows),
        'limits':{k:v for k,v in config.items() if k.startswith('max_')},
        'note':'Hypothèses historiques non validées. Aucun fill réel en prepare/paper. Attributions par règle non additives.'}
     atomic(folder/'status.json',dumps(summary))

@@ -123,6 +123,20 @@ def phase(i, now):
     return 'ENDED_AWAITING_OFFICIAL_RESOLUTION'
 
 
+def committed_risk(db, i, config):
+    """Release exposure only after final order/trades; cash remains a separate gate."""
+    if not i.get('committed_cost') or i['state']=='REJECTED':
+        return D(0)
+    terminal = i['state'] in ('FILLED','CANCELED','CANCELLED','EXPIRED','INVALID',
+                             'CANCELED_MARKET_RESOLVED','PAPER_EXPIRED_REMAINDER')
+    p = position(db,i)
+    if not terminal or p['unconfirmed_trade_count'] or D(p['quantity'])!=D(i.get('matched_qty','0')):
+        return D(i['committed_cost'])
+    if i.get('winner'):
+        return D(0)
+    return D(p['gross_cost'])*(1+D(config['fee_reserve_fraction']))
+
+
 def exposure_ok(db, i, config, now):
     limits = ['max_order_cost','max_total_committed_cost','max_daily_committed_cost','max_open_orders']
     if config['mode']=='live' and any(config[k] is None for k in limits):
@@ -130,11 +144,10 @@ def exposure_ok(db, i, config, now):
     reserve = 1 + D(config['fee_reserve_fraction'])
     cost = D(i['price'])*D(i['size'])*reserve
     existing = [x for x in intents(db) if x['id']!=i['id'] and x.get('committed_cost')]
-    # Conservative lifetime total cap; never recycle losing/resolved commitments automatically.
-    total = sum((D(x['committed_cost']) for x in existing),D(0))
+    total = sum((committed_risk(db,x,config) for x in existing),D(0))
     day = int(now)//86400
-    daily = sum((D(x['committed_cost']) for x in existing if int(x['committed_at'])//86400==day),D(0))
-    active = sum(x['state'] in ('SENDING','UNKNOWN','LIVE') for x in existing)
+    daily = sum((D(x['committed_cost']) for x in existing if x['state']!='REJECTED' and int(x['committed_at'])//86400==day),D(0))
+    active = sum(committed_risk(db,x,config)>0 for x in existing)
     for key,amount in [('max_order_cost',cost),('max_total_committed_cost',total+cost),
                        ('max_daily_committed_cost',daily+cost),('max_open_orders',D(active+1))]:
         if config[key] is not None and amount > D(str(config[key])):
@@ -273,6 +286,30 @@ class Engine:
             i['last_error']='exposure_limit:'+cost
             save(self.db,i,next_check=now+30)
             return
+        # Include local orders not yet visible in the account snapshot, plus
+        # matched-but-unconfirmed portions. Account-wide open BUYs are read by
+        # the adapter, including orders from other bots (never modified here).
+        reserve = 1+D(self.config['fee_reserve_fraction'])
+        reservations=[]
+        for x in intents(self.db):
+            if x['id']==i['id'] or not x.get('committed_cost') or x['state']=='REJECTED':
+                continue
+            p=position(self.db,x)
+            pending=max(D(0),D(x.get('matched_qty','0'))-D(p['quantity']))
+            missing = D(x['committed_cost']) if x['state'] in ('LIVE','SENDING','UNKNOWN') or now-x['committed_at']<60 or p['unconfirmed_trade_count'] else D(0)
+            if missing or pending:
+                reservations.append({'order_id':x['order_id'],'missing':str(missing),
+                                     'pending':str(pending*D(x['price'])*reserve)})
+        funds=self.adapter.funds(i,reservations,self.config['fee_reserve_fraction'])
+        available=D(funds['available'])
+        if not available.is_finite() or available<0:
+            raise ValueError('invalid_available_balance')
+        meta(self.db,'funds',funds)
+        meta(self.db,'funds_checked_at',time.time())
+        if available<D(cost):
+            i['last_error']='insufficient_available_funds'
+            save(self.db,i,'WAITING_FUNDS',now+30)
+            return
         # Verify current constraints, but NEVER change the stored price.
         m=self.api.market(i['opening'])
         if not m or validate_market(m,i['opening'])[i['direction']]!=i['token'] or not m.get('acceptingOrders') or m.get('closed'):
@@ -302,7 +339,14 @@ class Engine:
                 raise ValueError('server_order_hash_mismatch')
             i['exchange_status']=r['status']
             i['trade_ids']=r.get('trade_ids',[])
-            save(self.db,i,'LIVE' if r['ok'] else 'REJECTED',now+15)
+            if r['ok']:
+                i['last_error']=None
+                save(self.db,i,'LIVE',now+15)
+            else:
+                for key in ('committed_cost','committed_at','order_id'):
+                    i.pop(key,None)
+                i['last_error']='balance_or_allowance_rejected' if r.get('retryable_funds') else 'order_rejected'
+                save(self.db,i,'WAITING_FUNDS' if r.get('retryable_funds') else 'REJECTED',now+30)
             journal(self.db,i['id'],'SUBMIT_RESPONSE',r)
         except Exception as e:
             i['last_error']='submission_ambiguous:'+type(e).__name__
@@ -337,7 +381,7 @@ class Engine:
                 journal(self.db,i['id'],'OFFICIAL_RESOLUTION',c)
         if i['state']=='PAPER_OPEN' and now>=i['opening']+300 and i['order_type']=='GTD':
             i['state']='PAPER_EXPIRED_REMAINDER'
-        if i['state']=='PREPARED' and now>=i['opening']:
+        if i['state'] in ('PREPARED','WAITING_FUNDS') and now>=i['opening']:
             i['state']='PREPARED_NOT_SUBMITTED'
         save(self.db,i,next_check=now+30 if now<i['opening']+600 else now+300)
 
@@ -347,8 +391,8 @@ class Engine:
         all_intents=intents(self.db)
         due=[i for i in all_intents if i.get('next_check',0)<=now and
              (not i.get('winner') or i['state'] in ('LIVE','UNKNOWN') or not i.get('binance'))]
-        # Waiting markets near opening first; then preparation/reconciliation; ended last.
-        due.sort(key=lambda i:(0 if i['state'] in ('LIVE','UNKNOWN') else 1 if i['opening']>now else 2,
+        # Reconcile committed capital before buying; available future slots first.
+        due.sort(key=lambda i:(0 if i['state'] in ('LIVE','UNKNOWN') or (i.get('committed_cost') and not i.get('winner')) else 1 if i['opening']>now else 2,
                                i['opening'] if i['opening']>now else i.get('next_check',0)))
         for i in due[:self.config['requests_per_cycle']]:
             if self.stop_requested() or (self.state_dir/'stop.request').exists() or self.api.now()-now>45:
@@ -360,7 +404,7 @@ class Engine:
                             self.prepare(i,self.api.now())
                             if i['state']=='PREPARED' and self.config['mode']=='live':
                                 self.submit(i,self.api.now())
-                    elif i['state']=='PREPARED' and self.config['mode']=='live' and now<i['opening']:
+                    elif i['state'] in ('PREPARED','WAITING_FUNDS') and self.config['mode']=='live' and now<i['opening']:
                         self.submit(i,self.api.now())
                     else:
                         self.observe(i,self.api.now())

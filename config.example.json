@@ -1,7 +1,7 @@
 {
   "mode": "prepare",
   "poll_seconds": 15,
-  "horizon_hours": 26,
+  "horizon_hours": 72,
   "requests_per_cycle": 16,
   "max_book_age_seconds": 30,
   "conflict_policy": "both",

@@ -53,11 +53,18 @@ class FakeAPI:
 
 
 class FakeAdapter:
-    def __init__(self): self.signs=0;self.posts=0;self.ambiguous=False;self.read={'status':'LIVE','matched_qty':'0','fills':[]}
+    def __init__(self):
+        self.signs=0;self.posts=0;self.ambiguous=False;self.available='100'
+        self.rejected=False;self.funds_fail=False
+        self.read={'status':'LIVE','matched_qty':'0','fills':[]}
+    def funds(self,i,reservations,fee):
+        if self.funds_fail: raise TimeoutError()
+        return {'available':self.available}
     def sign(self,i): self.signs+=1;return object(),'oid'
     def submit(self,signed):
         self.posts+=1
         if self.ambiguous: raise TimeoutError()
+        if self.rejected: return {'ok':False,'order_id':None,'status':'REJECTED','trade_ids':[], 'retryable_funds':True}
         return {'ok':True,'order_id':'oid','status':'live','trade_ids':[]}
     def reconcile(self,i): return self.read
 
@@ -243,6 +250,97 @@ class TestEngine(unittest.TestCase):
         with self.db: self.engine.prepare(second,NOW)
         self.engine.submit(second,NOW)
         self.assertEqual(adapter.posts,1);self.assertIn('ambiguous',second['last_error'])
+    def test_insufficient_funds_restart_then_credit_preserves_price(self):
+        i=self.prepared();price=i['price'];adapter=self.live();adapter.available='0'
+        self.engine.submit(i,NOW)
+        self.assertEqual(i['state'],'WAITING_FUNDS');self.assertEqual(adapter.signs,0)
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter)
+        i=self.one();adapter.available='10'
+        self.api.b['asks']=[{'price':'.70','size':'50'}]
+        self.engine.submit(i,NOW+30)
+        self.assertEqual(i['state'],'LIVE');self.assertEqual(i['price'],price)
+        self.assertEqual(adapter.posts,1)
+    def test_funds_read_failure_never_signs(self):
+        i=self.prepared();adapter=self.live();adapter.funds_fail=True
+        with self.assertRaises(TimeoutError): self.engine.submit(i,NOW)
+        self.assertEqual(adapter.signs,0);self.assertEqual(adapter.posts,0)
+    def test_explicit_funds_rejection_retries_without_commitment(self):
+        i=self.prepared();adapter=self.live();adapter.rejected=True
+        self.engine.submit(i,NOW)
+        self.assertEqual(i['state'],'WAITING_FUNDS');self.assertNotIn('committed_cost',i)
+        adapter.rejected=False;self.engine.submit(i,NOW+30)
+        self.assertEqual(i['state'],'LIVE');self.assertEqual(adapter.posts,2)
+    def test_waiting_funds_past_opening_is_never_submitted(self):
+        i=self.prepared();adapter=self.live();adapter.available='0'
+        self.engine.submit(i,NOW);self.api.t=OPEN+1
+        self.engine.submit(i,OPEN+1)
+        self.engine.observe(i,OPEN+1)
+        self.assertEqual(i['state'],'PREPARED_NOT_SUBMITTED');self.assertEqual(adapter.posts,0)
+    def test_resolved_exposure_recycles_but_daily_limit_does_not(self):
+        first=self.prepared();adapter=self.live();first['mode']='live'
+        self.engine.submit(first,NOW)
+        adapter.read={'status':'FILLED','matched_qty':'5','fills':[
+            {'id':'f','leg':'taker','qty':'5','price':'.5','status':'CONFIRMED'}]}
+        self.api.winner='Down';self.api.t=OPEN+302
+        self.engine.observe(first,self.api.t)
+        second=self.one('Down');second.update(price='.5',size='5')
+        self.config.update(max_total_committed_cost='3',max_daily_committed_cost='3')
+        self.assertEqual(exposure_ok(self.db,second,self.config,NOW)[1],'max_daily_committed_cost')
+        self.config['max_daily_committed_cost']='100'
+        self.assertTrue(exposure_ok(self.db,second,self.config,NOW)[0])
+        # Resolution releases the risk cap, but it never invents cash credit.
+        self.api.winner=None;self.api.t=NOW;adapter.available='0'
+        with self.db: self.engine.prepare(second,NOW)
+        self.engine.submit(second,NOW)
+        self.assertEqual(second['state'],'WAITING_FUNDS')
+    def test_filled_unresolved_position_still_occupies_exposure(self):
+        first=self.prepared();adapter=self.live();first['mode']='live'
+        self.engine.submit(first,NOW)
+        adapter.read={'status':'FILLED','matched_qty':'5','fills':[
+            {'id':'f','leg':'taker','qty':'5','price':'.5','status':'CONFIRMED'}]}
+        self.engine.observe(first,NOW)
+        second=self.one('Down');second.update(price='.5',size='5')
+        self.config['max_open_orders']=1
+        self.assertEqual(exposure_ok(self.db,second,self.config,NOW)[1],'max_open_orders')
+    def test_ten_funded_and_seven_waiting_resume_after_cash_credit(self):
+        template=self.prepared();adapter=self.live();cash=[D('27.5')]
+        self.config.update(max_open_orders=30,max_total_committed_cost='100',max_daily_committed_cost='100')
+        adapter.funds=lambda *args:{'available':str(cash[0])}
+        def post(signed):
+            adapter.posts+=1;cash[0]-=D('2.75')
+            return {'ok':True,'order_id':signed,'status':'live','trade_ids':[]}
+        adapter.submit=post
+        adapter.sign=lambda i:(i['id'],i['id'])
+        def exact_market(opening):
+            m=market();m.update(slug=f'btc-updown-5m-{opening}',
+                               eventStartTime=datetime.fromtimestamp(opening,timezone.utc).isoformat(),
+                               endDate=datetime.fromtimestamp(opening+300,timezone.utc).isoformat())
+            m['events']=[];self.api.m=m;return m
+        self.api.market=exact_market
+        queue=[]
+        with self.db:
+            self.db.execute('DELETE FROM links')
+            self.db.execute('DELETE FROM intents')
+            for k in range(17):
+                i={**template,'id':f'queue-{k}','opening':OPEN+k*300,'mode':'live','state':'PREPARED'}
+                self.db.execute('INSERT INTO intents VALUES (?,?,?,?,?,0)',
+                                (i['id'],i['opening'],i['direction'],i['state'],json.dumps(i)))
+                self.engine.submit(i,NOW);queue.append(i)
+        self.assertEqual(adapter.posts,10)
+        self.assertEqual(sum(i['state']=='WAITING_FUNDS' for i in queue),7)
+        cash[0]=D('19.25')  # externally credited cash, not theoretical winners
+        with self.db:
+            for i in queue:
+                if i['state']=='WAITING_FUNDS': self.engine.submit(i,NOW+30)
+        self.assertEqual(adapter.posts,17)
+        self.assertTrue(all(i['state']=='LIVE' for i in queue))
+    def test_72_hour_horizon_and_absent_market_survives_restart(self):
+        self.assertEqual(self.config['horizon_hours'],72)
+        self.assertTrue(any(i['opening']>=OPEN+2*86400 for i in intents(self.db)))
+        i=self.one();self.api.m=None
+        with self.db: self.engine.prepare(i,NOW)
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder)
+        self.assertEqual(self.one()['state'],'WAITING')
     def test_crash_sending_recovered_as_unknown(self):
         i=self.prepared()
         with self.db: save(self.db,i,'SENDING')
@@ -326,6 +424,60 @@ class TestEngine(unittest.TestCase):
 
 
 class TestSDKOffline(unittest.TestCase):
+    def funds_adapter(self,balance=10000000,orders=()):
+        from execution import LiveAdapter
+        from polymarket.environments import PRODUCTION
+        from polymarket._internal.actions.orders.context import resolve_order_exchange_address
+        config=PRODUCTION._config
+        spender=str(resolve_order_exchange_address(config,asset_id='123',neg_risk=False))
+        adapter=object.__new__(LiveAdapter)
+        adapter.client=SimpleNamespace(wallet_type='EOA',_ctx=SimpleNamespace(environment_config=config,
+            secure_clob=SimpleNamespace(get_bytes=lambda *a,**kw:b'')),
+            get_balance_allowance=lambda **kw:SimpleNamespace(balance=balance,allowances={spender.upper():10000000}),
+            list_open_orders=lambda:SimpleNamespace(iter_items=lambda:iter(orders)))
+        return adapter
+    def test_account_buy_reservations_and_units_include_other_bots(self):
+        orders=[SimpleNamespace(id='external',side='BUY',price=D('.5'),original_size=D('10'),size_matched=D('2')),
+                SimpleNamespace(id='sell',side='SELL',price=D('.5'),original_size=D('10'),size_matched=D('0'))]
+        adapter=self.funds_adapter(orders=orders)
+        f=adapter.funds({'token':'123','neg_risk':False},[],'.10')
+        self.assertEqual(D(f['balance']),D('10'))
+        self.assertEqual(D(f['open_buy_reserved']),D('4.4'))
+        self.assertEqual(D(f['available']),D('5.6'))
+    def test_recent_order_not_yet_visible_blocks_overspending(self):
+        adapter=self.funds_adapter(balance=3000000)
+        f=adapter.funds({'token':'123','neg_risk':False},[
+            {'order_id':'missing','missing':'2.75','pending':'0'}],'.10')
+        self.assertEqual(D(f['available']),D('.25'))
+    def test_own_open_order_not_double_counted_and_pending_fill_reserved(self):
+        order=SimpleNamespace(id='own',side='BUY',price=D('.5'),original_size=D('5'),size_matched=D('2'))
+        adapter=self.funds_adapter(orders=[order])
+        f=adapter.funds({'token':'123','neg_risk':False},[
+            {'order_id':'own','missing':'2.75','pending':'1.1'}],'.10')
+        self.assertEqual(D(f['available']),D('7.25'))
+    def test_missing_allowance_waits_without_approving(self):
+        adapter=self.funds_adapter()
+        adapter.client.get_balance_allowance=lambda **kw:SimpleNamespace(balance=10000000,allowances={})
+        self.assertEqual(adapter.funds({'token':'123','neg_risk':False},[],'.1')['available'],'0')
+    def test_invalid_account_amounts_fail_closed(self):
+        order=SimpleNamespace(id='bad',side='BUY',price=D('.5'),original_size=D('5'),size_matched=D('6'))
+        with self.assertRaises(ValueError): self.funds_adapter(orders=[order]).funds({'token':'123','neg_risk':False},[],'.1')
+        with self.assertRaises(ValueError): self.funds_adapter(balance=-1).funds({'token':'123','neg_risk':False},[],'.1')
+    def test_balance_index_refresh_is_get_and_rate_limited(self):
+        adapter=self.funds_adapter();calls=[]
+        adapter.client._ctx.secure_clob.get_bytes=lambda path,**kw:calls.append((path,kw))
+        with patch('execution.time.monotonic',side_effect=[100,110,131]):
+            for _ in range(3): adapter.funds({'token':'123','neg_risk':False},[],'.1')
+        self.assertEqual(len(calls),2);self.assertEqual(calls[0][0],'/balance-allowance/update')
+    def test_http400_funds_rejection_is_safe_but_timeout_is_ambiguous(self):
+        from polymarket.errors import RequestRejectedError
+        adapter=self.funds_adapter()
+        def rejected(_): raise RequestRejectedError('not enough balance / allowance',status=400)
+        adapter.client.post_order=rejected
+        self.assertTrue(adapter.submit(object())['retryable_funds'])
+        def timeout(_): raise TimeoutError()
+        adapter.client.post_order=timeout
+        with self.assertRaises(TimeoutError): adapter.submit(object())
     def test_four_variable_configuration_derives_credentials(self):
         from execution import credential_options
         options,kind=credential_options({'POLYMARKET_PRIVATE_KEY':'fixture-key','POLYMARKET_FUNDER':'fixture-wallet',

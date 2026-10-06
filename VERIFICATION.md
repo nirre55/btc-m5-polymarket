@@ -1,5 +1,20 @@
 # Vérification du 6 octobre 2026
 
+## Mise à jour file d'attente / capital
+
+Suite complète : 70 tests (un contrôle de provenance du workspace d'origine
+ignoré dans un clone autonome). Scénarios ajoutés : 10 achats et 7 attentes,
+reprise après crédit cash, prix conservé et reprise SQLite, fonds indisponibles,
+refus explicite versus timeout, réservations des autres bots, lecture du solde
+en unités de base, refresh de l'index CLOB limité à une fois par 30 secondes,
+plafond simultané recyclé après résolution sans inventer de cash et plafond
+quotidien non recyclé. Horizon roulant de 72 heures et marchés absents.
+
+Les scénarios live utilisent des fixtures : aucune authentification réelle,
+signature d'ordre réel, soumission, approval ou redemption par l'agent.
+
+Le rapport historique ci-dessous reste celui de la livraison initiale.
+
 Livraison initiale dans `bots/BTCUSDT_M5_POLYMARKET`, indépendante du service existant.
 Ce rapport décrit la vérification dans le workspace d’origine. Les sondes JSON
 et données `state_prepare` mentionnées ci-dessous ne sont pas distribuées dans
