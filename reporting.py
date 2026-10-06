@@ -64,6 +64,9 @@ def report(db, rules, folder, config, alive):
        'cohorts':cohorts,'execution_disabled':config['mode']!='live',
        'active_committed_cost':str(sum((committed_risk(db,i,config) for i in rows),0)),
        'funds_waiting':sum(i['state']=='WAITING_FUNDS' for i in rows),
+       'funds_retry_utc':stamp(health['funds_retry_at']) if health.get('funds_retry_at') else None,
+       'funds_retry_toronto':stamp(health['funds_retry_at'],True) if health.get('funds_retry_at') else None,
+       'capital_policy':'AVAILABLE_BALANCE' if config.get('use_available_balance') else 'EXPLICIT_LIMITS',
        'limits':{k:v for k,v in config.items() if k.startswith('max_')},
        'note':'Hypothèses historiques non validées. Aucun fill réel en prepare/paper. Attributions par règle non additives.'}
     atomic(folder/'status.json',dumps(summary))

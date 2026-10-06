@@ -115,7 +115,9 @@ ne supprime jamais les exécutions déjà confirmées.
 Les paramètres d'exposition sont `max_order_cost`, `max_total_committed_cost`,
 `max_daily_committed_cost`, `max_open_orders`. Aucun budget monétaire réel n'est
 choisi pour l'utilisateur : ils sont `null` en prepare/paper et **tous obligatoires
-en live**. Frais : réserve prudente configurable `fee_reserve_fraction=0.10`,
+en live par défaut**. Le profil explicite `use_available_balance=true` permet de
+les laisser à null pour utiliser le solde disponible sans plafond monétaire fixe.
+Frais : réserve prudente configurable `fee_reserve_fraction=0.10`,
 incluse dans les engagements, pas une estimation de frais réellement payés.
 Le total plafonne le capital simultanément engagé : ordres en cours, exécutions
 non confirmées et positions non résolues. Une résolution ne libère ce plafond
@@ -134,6 +136,14 @@ Un montant insuffisant devient `WAITING_FUNDS`, vérifié à nouveau après 30 s
 sans changer le prix initial. Un refus explicite de balance remet également
 l'intention en attente ; une réponse ambiguë reste UNKNOWN et bloque les achats.
 Une lecture indisponible ne permet aucune soumission.
+
+Avec `use_available_balance=true`, un manque de fonds suspend **tous** les nouveaux
+achats pour `balance_retry_seconds=7200` (deux heures). L'échéance est persistée
+dans SQLite et affichée en UTC/Toronto. À chaque échéance, le solde est rafraîchi :
+assez pour une intention encore future -> reprise ; insuffisant -> nouvelle pause
+de deux heures. Les gains théoriques ne sont pas des fonds disponibles. Le suivi
+des positions et la découverte horaire continuent pendant la pause. Une erreur
+de lecture bloque les achats et déclenche un réessai technique après cinq minutes.
 
 Les créneaux disponibles les plus proches passent d'abord ; un marché absent
 ou un carnet invalide ne bloque pas les autres marchés. Après l'ouverture,

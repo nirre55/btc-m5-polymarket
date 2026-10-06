@@ -139,7 +139,7 @@ def committed_risk(db, i, config):
 
 def exposure_ok(db, i, config, now):
     limits = ['max_order_cost','max_total_committed_cost','max_daily_committed_cost','max_open_orders']
-    if config['mode']=='live' and any(config[k] is None for k in limits):
+    if config['mode']=='live' and not config.get('use_available_balance') and any(config[k] is None for k in limits):
         return False, 'live_limits_required'
     reserve = 1 + D(config['fee_reserve_fraction'])
     cost = D(i['price'])*D(i['size'])*reserve
@@ -281,25 +281,14 @@ class Engine:
             i.update(committed_cost=cost,committed_at=now,matched_qty=str(size-remaining))
             save(self.db,i,'PAPER_OPEN',now+30)
 
-    def submit(self, i, now):
-        if self.halted() or now+self.api.uncertainty>=i['opening']:
-            return
-        if any(x['state'] in ('UNKNOWN','SENDING') for x in intents(self.db)):
-            i['last_error']='ambiguous_order_blocks_new_submissions'
-            save(self.db,i,next_check=now+30)
-            return
-        allowed,cost=exposure_ok(self.db,i,self.config,now)
-        if not allowed:
-            i['last_error']='exposure_limit:'+cost
-            save(self.db,i,next_check=now+30)
-            return
+    def funds_reservations(self, now, exclude=None):
         # Include local orders not yet visible in the account snapshot, plus
         # matched-but-unconfirmed portions. Account-wide open BUYs are read by
         # the adapter, including orders from other bots (never modified here).
         reserve = 1+D(self.config['fee_reserve_fraction'])
         reservations=[]
         for x in intents(self.db):
-            if x['id']==i['id'] or not x.get('committed_cost') or x['state']=='REJECTED':
+            if x['id']==exclude or not x.get('committed_cost') or x['state']=='REJECTED':
                 continue
             p=position(self.db,x)
             pending=max(D(0),D(x.get('matched_qty','0'))-D(p['quantity']))
@@ -307,16 +296,85 @@ class Engine:
             if missing or pending:
                 reservations.append({'order_id':x['order_id'],'missing':str(missing),
                                      'pending':str(pending*D(x['price'])*reserve)})
-        funds=self.adapter.funds(i,reservations,self.config['fee_reserve_fraction'])
+        return reservations
+
+    def read_funds(self, i, now):
+        funds=self.adapter.funds(i,self.funds_reservations(now,i.get('id')),self.config['fee_reserve_fraction'])
         available=D(funds['available'])
         if not available.is_finite() or available<0:
             raise ValueError('invalid_available_balance')
         meta(self.db,'funds',funds)
         meta(self.db,'funds_checked_at',time.time())
-        if available<D(cost):
-            i['last_error']='insufficient_available_funds'
-            save(self.db,i,'WAITING_FUNDS',now+30)
+        meta(self.db,'funds_read_error','')
+        return available
+
+    def wait_for_funds(self, i, now, reason):
+        i['last_error']=reason
+        if self.config.get('use_available_balance'):
+            retry_at=now+self.config['balance_retry_seconds']
+            meta(self.db,'funds_retry_at',retry_at)
+            meta(self.db,'funds_probe',{'token':i['token'],'neg_risk':i['neg_risk'],
+                 'required_cost':str(D(i['price'])*D(i['size'])*(1+D(self.config['fee_reserve_fraction'])))})
+            journal(self.db,i['id'],'FUNDS_PAUSE',{'retry_at':retry_at,'reason':reason})
+        else:
+            retry_at=now+30
+        save(self.db,i,'WAITING_FUNDS',min(retry_at,i['opening']))
+
+    def poll_paused_funds(self, now):
+        if self.config['mode']!='live' or not self.config.get('use_available_balance') or self.halted():
             return
+        retry_at=meta(self.db,'funds_retry_at') or 0
+        if not retry_at or now<retry_at:
+            return
+        probe=meta(self.db,'funds_probe')
+        future=[i for i in intents(self.db) if i['opening']>now and i['state'] in ('PREPARED','WAITING_FUNDS')]
+        if future:
+            candidate=min(future,key=lambda x:D(x['price'])*D(x['size']))
+            probe={'token':candidate['token'],'neg_risk':candidate['neg_risk'],
+                   'required_cost':str(D(candidate['price'])*D(candidate['size'])*(1+D(self.config['fee_reserve_fraction'])))}
+        if not probe:
+            raise ValueError('missing_funds_probe')
+        with self.db:
+            try:
+                available=self.read_funds(probe,now)
+            except Exception as exc:
+                # A read failure is not evidence of sufficient funds.
+                meta(self.db,'funds_read_error',type(exc).__name__)
+                meta(self.db,'funds_retry_at',now+300)
+                return
+            if available<D(probe['required_cost']):
+                meta(self.db,'funds_retry_at',now+self.config['balance_retry_seconds'])
+                journal(self.db,None,'FUNDS_STILL_INSUFFICIENT',{'retry_at':meta(self.db,'funds_retry_at')})
+            else:
+                meta(self.db,'funds_retry_at',0)
+                journal(self.db,None,'FUNDS_AVAILABLE',{'available':str(available)})
+                for i in future:
+                    if i['state']=='WAITING_FUNDS':
+                        save(self.db,i,next_check=now)
+
+    def submit(self, i, now):
+        if self.halted() or now+self.api.uncertainty>=i['opening']:
+            return
+        if any(x['state'] in ('UNKNOWN','SENDING') for x in intents(self.db)):
+            i['last_error']='ambiguous_order_blocks_new_submissions'
+            save(self.db,i,next_check=now+30)
+            return
+        retry_at=meta(self.db,'funds_retry_at') or 0
+        if self.config.get('use_available_balance') and now<retry_at:
+            i['last_error']='funds_pause_until_next_check'
+            save(self.db,i,'WAITING_FUNDS',min(retry_at,i['opening']))
+            return
+        allowed,cost=exposure_ok(self.db,i,self.config,now)
+        if not allowed:
+            i['last_error']='exposure_limit:'+cost
+            save(self.db,i,next_check=now+30)
+            return
+        available=self.read_funds(i,now)
+        if available<D(cost):
+            self.wait_for_funds(i,now,'insufficient_available_funds')
+            return
+        if self.config.get('use_available_balance'):
+            meta(self.db,'funds_retry_at',0)
         # Verify current constraints, but NEVER change the stored price.
         m=self.api.market(i['opening'])
         if not m or validate_market(m,i['opening'])[i['direction']]!=i['token'] or not m.get('acceptingOrders') or m.get('closed'):
@@ -352,8 +410,11 @@ class Engine:
             else:
                 for key in ('committed_cost','committed_at','order_id'):
                     i.pop(key,None)
-                i['last_error']='balance_or_allowance_rejected' if r.get('retryable_funds') else 'order_rejected'
-                save(self.db,i,'WAITING_FUNDS' if r.get('retryable_funds') else 'REJECTED',now+30)
+                if r.get('retryable_funds'):
+                    self.wait_for_funds(i,now,'balance_or_allowance_rejected')
+                else:
+                    i['last_error']='order_rejected'
+                    save(self.db,i,'REJECTED',now+30)
             journal(self.db,i['id'],'SUBMIT_RESPONSE',r)
         except Exception as e:
             i['last_error']='submission_ambiguous:'+type(e).__name__
@@ -395,6 +456,7 @@ class Engine:
     def cycle(self):
         now=self.api.sync()
         schedule(self.db,self.rules,now,self.config)
+        self.poll_paused_funds(now)
         all_intents=intents(self.db)
         due=[i for i in all_intents if i.get('next_check',0)<=now and
              (not i.get('winner') or i['state'] in ('LIVE','UNKNOWN') or not i.get('binance'))]

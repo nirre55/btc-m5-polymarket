@@ -1,5 +1,11 @@
 # Vérification du 6 octobre 2026
 
+Politique de solde disponible : 81 tests exécutés (un contrôle de source externe
+ignoré). Tests de pause commune deux heures, persistance après fermeture/réouverture
+SQLite, insuffisance répétée, reprise après crédit, aucun contournement par une
+autre direction, entrée expirée non ressuscitée, lecture en erreur fail-closed et
+activation sans plafonds uniquement sous politique explicitement configurée.
+
 Mise à jour découverte horaire : 73 tests exécutés, un contrôle de source externe
 ignoré dans un clone autonome. Marché absent distant : prochain contrôle à +3600s ;
 dernier contrôle à ouverture moins 60s ; ensuite MISSED sans requête ni ordre

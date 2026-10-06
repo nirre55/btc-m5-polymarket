@@ -11,5 +11,7 @@
   "max_daily_committed_cost": null,
   "max_open_orders": null,
   "fee_reserve_fraction": "0.10",
-  "enable_live": false
+  "enable_live": false,
+  "use_available_balance": false,
+  "balance_retry_seconds": 7200
 }

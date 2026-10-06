@@ -11,7 +11,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 import bot
-from engine import connect, initialize, schedule, intents, save, Engine, position, apply_reconciliation, exposure_ok, phase
+from engine import connect, initialize, schedule, intents, save, Engine, position, apply_reconciliation, exposure_ok, phase, meta
 from frozen_calendar import load_rules, matches, next_activation, TZ, calendar_values
 from public_api import quote, validate_market, official_winner
 from reporting import report
@@ -281,6 +281,74 @@ class TestEngine(unittest.TestCase):
         i=self.prepared();adapter=self.live();adapter.funds_fail=True
         with self.assertRaises(TimeoutError): self.engine.submit(i,NOW)
         self.assertEqual(adapter.signs,0);self.assertEqual(adapter.posts,0)
+    def balance_policy(self):
+        adapter=self.live()
+        self.config.update(use_available_balance=True,balance_retry_seconds=7200,
+            max_order_cost=None,max_total_committed_cost=None,max_daily_committed_cost=None,max_open_orders=None)
+        return adapter
+    def test_balance_policy_without_fixed_caps_still_checks_cash(self):
+        i=self.prepared();adapter=self.balance_policy();adapter.available='0'
+        self.assertTrue(exposure_ok(self.db,i,self.config,NOW)[0])
+        self.engine.submit(i,NOW)
+        self.assertEqual(i['state'],'WAITING_FUNDS');self.assertEqual(adapter.signs,0)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+7200)
+    def test_global_two_hour_pause_survives_restart_and_repeats_then_resumes(self):
+        i=self.prepared();i['opening']=NOW+20000
+        self.api.m=market(i['opening']);self.api.market=lambda opening:self.api.m
+        with self.db: save(self.db,i)
+        adapter=self.balance_policy();calls=[]
+        def funds(*args): calls.append(self.api.t);return {'available':adapter.available}
+        adapter.funds=funds;adapter.available='0'
+        with self.db: self.engine.submit(i,NOW)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+7200)
+        self.db.close();self.db=connect(self.folder/'test.sqlite3')
+        self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter)
+        self.engine.submit(i,NOW+3600)
+        self.engine.poll_paused_funds(NOW+7199)
+        self.assertEqual(len(calls),1);self.assertEqual(adapter.signs,0)
+        self.engine.poll_paused_funds(NOW+7200)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+14400)
+        adapter.available='10'
+        self.engine.poll_paused_funds(NOW+14399)
+        self.assertEqual(len(calls),2)
+        self.api.t=NOW+14400
+        self.engine.poll_paused_funds(self.api.t)
+        self.assertEqual(meta(self.db,'funds_retry_at'),0)
+        i=next(x for x in intents(self.db) if x['id']==i['id'])
+        self.engine.submit(i,self.api.t)
+        self.assertEqual(i['state'],'LIVE');self.assertEqual(adapter.posts,1)
+        self.assertEqual(i['price'],'0.50')
+    def test_pause_blocks_other_direction_without_read_or_sign(self):
+        i=self.prepared();adapter=self.balance_policy();adapter.available='0'
+        self.engine.submit(i,NOW)
+        other=self.one('Down')
+        with self.db: self.engine.prepare(other,NOW)
+        adapter.available='100'
+        self.engine.submit(other,NOW+10)
+        self.assertEqual(other['state'],'WAITING_FUNDS');self.assertEqual(adapter.signs,0)
+        self.assertEqual(other['next_check'],OPEN)
+    def test_expired_intent_not_resurrected_by_balance_credit(self):
+        i=self.prepared();adapter=self.balance_policy();adapter.available='0'
+        self.engine.submit(i,NOW)
+        self.api.t=OPEN+1
+        with self.db: self.engine.observe(i,self.api.t)
+        adapter.available='100';self.api.t=NOW+7200
+        self.engine.poll_paused_funds(self.api.t)
+        self.engine.submit(i,self.api.t)
+        self.assertEqual(i['state'],'PREPARED_NOT_SUBMITTED');self.assertEqual(adapter.posts,0)
+    def test_balance_read_failure_at_wakeup_keeps_new_orders_blocked(self):
+        i=self.prepared();adapter=self.balance_policy();adapter.available='0'
+        self.engine.submit(i,NOW);adapter.funds_fail=True
+        self.engine.poll_paused_funds(NOW+7200)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+7500)
+        self.assertEqual(meta(self.db,'funds_read_error'),'TimeoutError')
+        self.assertEqual(adapter.signs,0)
+    def test_explicit_funds_rejection_starts_two_hour_pause(self):
+        i=self.prepared();adapter=self.balance_policy();adapter.rejected=True
+        self.engine.submit(i,NOW)
+        self.assertNotIn('committed_cost',i)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+7200)
+        self.engine.submit(i,NOW+30);self.assertEqual(adapter.posts,1)
     def test_explicit_funds_rejection_retries_without_commitment(self):
         i=self.prepared();adapter=self.live();adapter.rejected=True
         self.engine.submit(i,NOW)
@@ -441,6 +509,25 @@ class TestEngine(unittest.TestCase):
 
 
 class TestSDKOffline(unittest.TestCase):
+    def test_available_balance_activation_needs_explicit_policy_and_live_flag(self):
+        c=bot.configuration(mode='prepare');c.update(enable_live=True,use_available_balance=True)
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'local.json';p.write_text(json.dumps(c))
+            with patch.dict('os.environ',{'POLY_ENABLE_LIVE':'I_ACCEPT_LIVE_ORDERS'}):
+                self.assertTrue(bot.configuration(p,'live')['use_available_balance'])
+                c['use_available_balance']=False;p.write_text(json.dumps(c))
+                with self.assertRaises(ValueError): bot.configuration(p,'live')
+            c['use_available_balance']=True;p.write_text(json.dumps(c))
+            with patch.dict('os.environ',{'POLY_ENABLE_LIVE':''}):
+                with self.assertRaises(ValueError): bot.configuration(p,'live')
+    def test_invalid_balance_policy_rejected(self):
+        c=bot.configuration(mode='prepare')
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'local.json'
+            for changes in ({'use_available_balance':'true'},{'balance_retry_seconds':0},
+                            {'balance_retry_seconds':7200.5}):
+                p.write_text(json.dumps({**c,**changes}))
+                with self.assertRaises(ValueError): bot.configuration(p,'prepare')
     def funds_adapter(self,balance=10000000,orders=()):
         from execution import LiveAdapter
         from polymarket.environments import PRODUCTION

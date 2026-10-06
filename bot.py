@@ -33,6 +33,8 @@ def configuration(path=None, mode=None, require_activation=True):
     if not 5<=config['poll_seconds']<=300 or not 1<=config['horizon_hours']<=72 or not 1<=config['requests_per_cycle']<=100 or not 1<=config['max_book_age_seconds']<=60:
         raise ValueError('invalid_poll_or_horizon')
     from decimal import Decimal
+    if type(config['use_available_balance']) is not bool or type(config['balance_retry_seconds']) is not int or not 30<=config['balance_retry_seconds']<=86400:
+        raise ValueError('invalid_balance_policy')
     for k in ['max_order_cost','max_total_committed_cost','max_daily_committed_cost','max_open_orders']:
         if config[k] is not None and (not Decimal(str(config[k])).is_finite() or Decimal(str(config[k]))<=0):
             raise ValueError('positive_finite_limit_required')
@@ -44,7 +46,7 @@ def configuration(path=None, mode=None, require_activation=True):
     if config['mode']=='live' and require_activation:
         if config['enable_live'] is not True or os.environ.get('POLY_ENABLE_LIVE')!='I_ACCEPT_LIVE_ORDERS':
             raise ValueError('live_disabled')
-        if any(config[k] is None for k in ['max_order_cost','max_total_committed_cost','max_daily_committed_cost','max_open_orders']):
+        if not config['use_available_balance'] and any(config[k] is None for k in ['max_order_cost','max_total_committed_cost','max_daily_committed_cost','max_open_orders']):
             raise ValueError('explicit_live_limits_required')
     return config
 
@@ -220,7 +222,7 @@ if __name__=='__main__':
         # SDK errors can carry credential-bearing request details; never dump traceback.
         known={'live_disabled','explicit_live_limits_required','unknown_configuration_keys','invalid_policy',
                'invalid_poll_or_horizon','positive_finite_limit_required','integer_open_order_limit_required',
-               'invalid_fee_reserve','startup_timeout','launch_failed_see_launcher_log','service_already_running'}
+               'invalid_fee_reserve','invalid_balance_policy','startup_timeout','launch_failed_see_launcher_log','service_already_running'}
         detail=':'+str(e) if str(e) in known else ''
         print('Échec : '+type(e).__name__+detail+'. Consulter configuration, rapport et journal local. Aucun secret affiché.',file=sys.stderr)
         sys.exit(1)
