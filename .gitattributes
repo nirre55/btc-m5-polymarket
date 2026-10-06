@@ -1,0 +1,2 @@
+# The frozen selection is verified byte for byte at startup.
+selected_rules.json -text

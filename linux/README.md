@@ -7,9 +7,8 @@ le calendrier reste America/Toronto, quel que soit le fuseau du VPS.
 
 ## Installation une seule fois
 
-Cloner le dépôt privé avec son compte GitHub. Pour HTTPS, utiliser un token
-GitHub ayant accès au dépôt lorsqu'un mot de passe est demandé ; ne pas mettre
-le token dans l'URL. Le clone reste dans le dossier personnel, et le service
+Cloner le dépôt public, sans authentification. Le clone reste dans le dossier
+personnel, et le service
 utilise une copie du code dans `/opt` sans credentials GitHub.
 
 Dans le terminal SSH du VPS :
