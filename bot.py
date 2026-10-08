@@ -35,6 +35,9 @@ def configuration(path=None, mode=None, require_activation=True):
     from decimal import Decimal
     if type(config['use_available_balance']) is not bool or type(config['balance_retry_seconds']) is not int or not 30<=config['balance_retry_seconds']<=86400:
         raise ValueError('invalid_balance_policy')
+    percent=config['position_balance_percent']
+    if percent is not None and (isinstance(percent,bool) or not Decimal(str(percent)).is_finite() or not 0<Decimal(str(percent))<=100):
+        raise ValueError('invalid_position_balance_percent')
     for k in ['max_order_cost','max_total_committed_cost','max_daily_committed_cost','max_open_orders']:
         if config[k] is not None and (not Decimal(str(config[k])).is_finite() or Decimal(str(config[k]))<=0):
             raise ValueError('positive_finite_limit_required')

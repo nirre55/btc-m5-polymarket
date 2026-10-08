@@ -286,3 +286,20 @@ refuse la reprise. Les fonctions de calendrier ont aussi été comparées par AS
 - [Frais](https://docs.polymarket.com/trading/fees)
 - [Marché sondé 9:45–9:50 Toronto, 6 octobre 2026](https://polymarket.com/event/btc-updown-5m-1791294300)
 - [Source Chainlink de ce marché](https://data.chain.link/streams/btc-usd-twap-60s-streams)
+
+## Taille proportionnelle au plus haut solde
+
+`position_balance_percent: "3"` active une cible de 3 % du plus haut solde collateral
+en espèces observé depuis l’activation. `null` conserve le minimum du marché.
+Le maximum `balance_high_water` est persisté dans SQLite et ne baisse pas lors de
+pertes, achats ou redémarrages. Le solde est relu avant chaque achat et au moins
+toutes les cinq minutes lorsqu’un token est connu. Les gains non crédités et
+les positions ouvertes ne sont pas ajoutés au solde de référence.
+
+Quantité = max(minimum du marché, cible / prix fixe arrondie vers le bas à 0,01
+share). Les frais sont réservés en supplément. Si le cash net disponible ne
+couvre pas cette quantité, le bot attend sans réduire la taille. Les intentions
+non soumises sont recalculées avant signature ; les ordres déjà envoyés restent
+intacts. Exemple : maximum100 => cible3 ; solde97 => cible3 ; maximum200 => cible6.
+Modifier le pourcentage dans le config local et redémarrer le service conserve
+le maximum existant. Aucun plus haut solde historique n’est reconstruit.

@@ -309,6 +309,44 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(meta(self.db,'funds_retry_at'),NOW+600)
         adapter.available='10';self.engine.poll_paused_funds(NOW+600)
         self.assertEqual(meta(self.db,'funds_retry_at'),0)
+    def test_high_water_persists_after_loss_restart_and_new_maximum(self):
+        i=self.prepared();adapter=self.live();self.config['position_balance_percent']='3'
+        for cash,expected in [('100','100'),('97','100'),('200','200'),('150','200')]:
+            adapter.funds=lambda *args,cash=cash:{'balance':cash,'available':cash}
+            self.engine.read_funds(i,NOW)
+            self.assertEqual(D(meta(self.db,'balance_high_water')),D(expected))
+            self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter)
+            self.assertEqual(self.engine.position_size(D('.5'),D('5')),D(expected)*D('.03')/D('.5'))
+    def test_percent_size_floor_rounding_and_config_change(self):
+        self.config['position_balance_percent']='3'
+        with self.db:meta(self.db,'balance_high_water','50')
+        self.assertEqual(self.engine.position_size(D('.5'),D('5')),D('5'))
+        with self.db:meta(self.db,'balance_high_water','100')
+        self.assertEqual(self.engine.position_size(D('.52'),D('5')),D('5.76'))
+        self.assertLessEqual(self.engine.position_size(D('.52'),D('5'))*D('.52'),D('3'))
+        self.config['position_balance_percent']='4'
+        self.assertEqual(self.engine.position_size(D('.5'),D('5')),D('8'))
+    def test_percent_sizes_before_signing_and_reserves_fees(self):
+        i=self.prepared();adapter=self.live();self.config['position_balance_percent']='3'
+        adapter.funds=lambda *args:{'balance':'100','available':'100'}
+        self.engine.submit(i,NOW)
+        self.assertEqual(D(i['size']),D('6'))
+        self.assertEqual(D(i['committed_cost']),D(i['size'])*D(i['price'])*D('1.10'))
+    def test_reference_survives_later_transaction_rollback(self):
+        i=self.prepared();adapter=self.live();self.config['position_balance_percent']='3'
+        adapter.funds=lambda *args:{'balance':'100','available':'100'}
+        with self.assertRaises(ValueError):
+            with self.db:
+                self.engine.read_funds(i,NOW)
+                raise ValueError('later_book_failure')
+        self.assertEqual(meta(self.db,'balance_high_water'),'100')
+    def test_insufficient_cash_never_shrinks_percent_position(self):
+        i=self.prepared();adapter=self.live();self.config['position_balance_percent']='3'
+        with self.db:meta(self.db,'balance_high_water','200')
+        adapter.funds=lambda *args:{'balance':'5','available':'5'}
+        self.engine.submit(i,NOW)
+        self.assertEqual(adapter.signs,0);self.assertEqual(i['state'],'WAITING_FUNDS')
+        self.assertGreater(D(i['size'])*D(i['price']),D('5'))
     def test_balance_policy_without_fixed_caps_still_checks_cash(self):
         i=self.prepared();adapter=self.balance_policy();adapter.available='0'
         self.assertTrue(exposure_ok(self.db,i,self.config,NOW)[0])

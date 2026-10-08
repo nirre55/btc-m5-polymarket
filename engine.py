@@ -1,5 +1,5 @@
 """Durable intent/order/fill/resolution state machine. No secret access here."""
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -306,7 +306,42 @@ class Engine:
         meta(self.db,'funds',funds)
         meta(self.db,'funds_checked_at',time.time())
         meta(self.db,'funds_read_error','')
+        if self.config.get('position_balance_percent') is not None:
+            cash=D(funds['balance'])
+            if not cash.is_finite() or cash<0:
+                raise ValueError('invalid_reference_balance')
+            peak=D(meta(self.db,'balance_high_water') or '0')
+            if cash>peak:
+                meta(self.db,'balance_high_water',str(cash))
+                journal(self.db,None,'BALANCE_HIGH_WATER',{'balance':str(cash)})
+            # Preserve a verified maximum even if a subsequent market/book read
+            # fails and its outer transaction rolls back.
+            self.db.commit()
         return available
+
+    def position_size(self, price, minimum):
+        percent=self.config.get('position_balance_percent')
+        if percent is None:
+            return minimum
+        target=D(meta(self.db,'balance_high_water') or '0')*D(str(percent))/100
+        shares=(target/price).quantize(D('.01'),rounding=ROUND_FLOOR)
+        return max(minimum,shares)
+
+    def poll_position_balance(self, now):
+        if self.config['mode']!='live' or self.config.get('position_balance_percent') is None or self.halted():
+            return
+        if now-(meta(self.db,'funds_checked_at') or 0)<300:
+            return
+        candidates=[i for i in intents(self.db) if i.get('token')]
+        if not candidates:
+            return
+        try:
+            self.read_funds(candidates[-1],now)
+        except Exception as exc:
+            with self.db:
+                meta(self.db,'funds_read_error',type(exc).__name__)
+                # Avoid hammering a failed account endpoint every cycle.
+                meta(self.db,'funds_checked_at',time.time())
 
     def wait_for_funds(self, i, now, reason):
         i['last_error']=reason
@@ -364,25 +399,30 @@ class Engine:
             i['last_error']='funds_pause_until_next_check'
             save(self.db,i,'WAITING_FUNDS',min(retry_at,i['opening']))
             return
-        allowed,cost=exposure_ok(self.db,i,self.config,now)
-        if not allowed:
-            i['last_error']='exposure_limit:'+cost
-            save(self.db,i,next_check=now+30)
-            return
         available=self.read_funds(i,now)
-        if available<D(cost):
-            self.wait_for_funds(i,now,'insufficient_available_funds')
-            return
-        if self.config.get('use_available_balance'):
-            meta(self.db,'funds_retry_at',0)
         # Verify current constraints, but NEVER change the stored price.
         m=self.api.market(i['opening'])
         if not m or validate_market(m,i['opening'])[i['direction']]!=i['token'] or not m.get('acceptingOrders') or m.get('closed'):
             raise ValueError('market_no_longer_accepting')
         book=self.api.book(i['token'])
         _,minimum,tick,_=quote(book,i['token'],i['condition'],D(str(self.api.now())),self.config['max_book_age_seconds'])
-        if D(i['price'])%tick or D(i['size'])<minimum:
+        if D(i['price'])%tick or (self.config.get('position_balance_percent') is None and D(i['size'])<minimum):
             raise ValueError('constraints_changed_no_reprice')
+        size=self.position_size(D(i['price']),minimum)
+        if self.config.get('position_balance_percent') is not None:
+            i['size']=str(size)
+            i['sizing_reference_balance']=meta(self.db,'balance_high_water') or '0'
+            i['sizing_percent']=str(self.config['position_balance_percent'])
+        allowed,cost=exposure_ok(self.db,i,self.config,now)
+        if not allowed:
+            i['last_error']='exposure_limit:'+cost
+            save(self.db,i,next_check=now+30)
+            return
+        if available<D(cost):
+            self.wait_for_funds(i,now,'insufficient_available_funds')
+            return
+        if self.config.get('use_available_balance'):
+            meta(self.db,'funds_retry_at',0)
         save(self.db,i,'SIGNING')
         self.db.commit()
         try:
@@ -457,6 +497,7 @@ class Engine:
         now=self.api.sync()
         schedule(self.db,self.rules,now,self.config)
         self.poll_paused_funds(now)
+        self.poll_position_balance(now)
         all_intents=intents(self.db)
         due=[i for i in all_intents if i.get('next_check',0)<=now and
              (not i.get('winner') or i['state'] in ('LIVE','UNKNOWN') or not i.get('binance'))]
