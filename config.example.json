@@ -13,5 +13,5 @@
   "fee_reserve_fraction": "0.10",
   "enable_live": false,
   "use_available_balance": false,
-  "balance_retry_seconds": 7200
+  "balance_retry_seconds": 300
 }

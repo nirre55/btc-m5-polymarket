@@ -134,14 +134,14 @@ pour déduire leurs réservations. Les engagements locaux absents de la lecture,
 les fills non confirmés et les engagements récents sont réservés prudemment.
 Un montant insuffisant devient `WAITING_FUNDS`, vérifié à nouveau après 30 secondes,
 sans changer le prix initial. Un refus explicite de balance remet également
-l'intention en attente ; une réponse ambiguë reste UNKNOWN et bloque les achats.
+l'intention en attente ; une réponse ambiguë reste UNKNOWN et réserve son coût, sans bloquer les autres intentions.
 Une lecture indisponible ne permet aucune soumission.
 
 Avec `use_available_balance=true`, un manque de fonds suspend **tous** les nouveaux
-achats pour `balance_retry_seconds=7200` (deux heures). L'échéance est persistée
+achats pour `balance_retry_seconds=300` (cinq minutes). L'échéance est persistée
 dans SQLite et affichée en UTC/Toronto. À chaque échéance, le solde est rafraîchi :
 assez pour une intention encore future -> reprise ; insuffisant -> nouvelle pause
-de deux heures. Les gains théoriques ne sont pas des fonds disponibles. Le suivi
+de cinq minutes. Les gains théoriques ne sont pas des fonds disponibles. Le suivi
 des positions et la découverte horaire continuent pendant la pause. Une erreur
 de lecture bloque les achats et déclenche un réessai technique après cinq minutes.
 
@@ -176,9 +176,13 @@ Le SDK officiel `polymarket-client==0.12.0` signe l'ordre puis `post_order` le s
 Un identifiant de hash d'ordre EIP-712 est journalisé durablement **avant** le POST.
 Crash en SENDING → UNKNOWN. Réponse réseau ambiguë → UNKNOWN. **Aucune
 resoumission automatique**, même si GET retourne 404 ; le bot tente le rapprochement
-du même identifiant et bloque les nouveaux ordres tant que l'ambiguïté persiste.
+du même identifiant. Seule l’intention incertaine est bloquée ; son coût maximal reste
+réservé et les autres intentions peuvent utiliser le solde restant.
 Une absence temporaire de réponse n'est ni un refus ni la preuve d'un ordre absent.
 Une ambiguïté durable nécessite une inspection locale du compte et du journal.
+Si la lecture directe échoue, les ordres ouverts puis les transactions du marché
+sont consultés, avec correspondance exacte du hash. Un historique vide ou
+l’expiration ne prouvent jamais l’absence d’exécution ; la réservation reste conservée.
 
 Le rapprochement lit l'ordre authentifié et les trades exacts associés, y compris
 les legs maker en cas d'exécution ultérieure. `matched_qty` n'est pas une position

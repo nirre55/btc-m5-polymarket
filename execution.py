@@ -131,6 +131,9 @@ class LiveAdapter:
                     ('not enough balance / allowance','allowance is not enough'))):
                 return {'ok':False,'order_id':None,'status':'REJECTED','trade_ids':[],
                         'code':'not_enough_balance','retryable_funds':True}
+            if e.status in (401,403,422):
+                return {'ok':False,'order_id':None,'status':'REJECTED','trade_ids':[],
+                        'code':'explicit_http_rejection','retryable_funds':False}
             raise
         return {'ok':r.ok, 'order_id':r.order_id if r.ok else None,
                 'status':r.status if r.ok else 'REJECTED',
@@ -138,7 +141,23 @@ class LiveAdapter:
                 'retryable_funds':not r.ok and r.code=='not_enough_balance'}
 
     def reconcile(self, intent):
-        order = self.client.get_order(order_id=intent['order_id'])
+        try:
+            order = self.client.get_order(order_id=intent['order_id'])
+        except Exception:
+            # A failed single-order read does not prove that the POST failed.
+            # Try independent authenticated views; identity must still match.
+            try:
+                orders = list(self.client.list_open_orders(id=intent['order_id'],
+                              asset_id=intent['token']).iter_items())
+            except Exception:
+                return self.reconcile_trades(intent)
+            exact = [o for o in orders if o.id == intent['order_id']]
+            if len(exact)>1:
+                raise ValueError('duplicate_reconciliation_order')
+            if exact:
+                order=exact[0]
+            else:
+                return self.reconcile_trades(intent)
         if (str(order.asset_id) != intent['token'] or order.side != 'BUY'
                 or str(order.condition_id) != intent['condition'] or order.id != intent['order_id']
                 or order.price != Decimal(intent['price']) or order.original_size != Decimal(intent['size'])):
@@ -164,6 +183,42 @@ class LiveAdapter:
                                           'price':str(leg.price), 'status':str(trade.status),
                                           'transaction_hash':trade.transaction_hash})
         return {'status':order.status, 'matched_qty':str(order.size_matched), 'fills':fills}
+
+    def reconcile_trades(self, intent):
+        """Recover fills by exact order identity, never infer absence from a scan."""
+        fills=[]; seen=set()
+        trades=self.client.list_account_trades(asset_id=intent['token'],
+                market=intent['condition'],after=str(int(intent['committed_at'])-60))
+        for trade in trades.iter_items():
+            legs=[]
+            if trade.taker_order_id==intent['order_id']:
+                if str(trade.asset_id)!=intent['token'] or trade.side!='BUY':
+                    raise ValueError('wrong_taker_asset')
+                legs=[('taker',trade.size,trade.price)]
+            else:
+                for leg in trade.maker_orders:
+                    if leg.order_id==intent['order_id']:
+                        if str(leg.asset_id)!=intent['token'] or leg.side!='BUY':
+                            raise ValueError('wrong_maker_asset')
+                        legs.append(('maker',leg.matched_amount,leg.price))
+            for role,qty,price in legs:
+                key=(trade.id,role)
+                if key in seen:
+                    raise ValueError('duplicate_reconciliation_fill')
+                seen.add(key)
+                qty,price=Decimal(qty),Decimal(price)
+                if not qty.is_finite() or qty<=0 or not price.is_finite() or not 0<price<=Decimal(intent['price']):
+                    raise ValueError('invalid_reconciliation_fill')
+                fills.append({'id':trade.id,'leg':role,'qty':str(qty),'price':str(price),
+                    'status':str(trade.status),'transaction_hash':trade.transaction_hash})
+        matched=sum((Decimal(f['qty']) for f in fills if f['status'].removeprefix('TRADE_STATUS_')!='FAILED'),Decimal(0))
+        confirmed=sum((Decimal(f['qty']) for f in fills if f['status'].removeprefix('TRADE_STATUS_')=='CONFIRMED'),Decimal(0))
+        if matched>Decimal(intent['size']):
+            raise ValueError('excess_reconciliation_quantity')
+        # Full confirmed execution is positive evidence. Empty/partial history,
+        # even after expiration, never authorizes a repost or reserve release.
+        return {'status':'FILLED' if confirmed==Decimal(intent['size']) else 'UNKNOWN',
+                'matched_qty':str(max(matched,Decimal(intent.get('matched_qty','0')))), 'fills':fills}
 
     def close(self):
         self.client.close()

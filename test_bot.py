@@ -263,10 +263,15 @@ class TestEngine(unittest.TestCase):
         self.engine.submit(i,NOW)
         self.assertEqual(i['state'],'UNKNOWN');self.assertEqual(adapter.posts,1)
         self.engine=Engine(self.db,self.rules,self.config,self.api,self.folder,adapter)
+        self.engine.submit(i,NOW)
+        self.assertEqual(adapter.posts,1)
         second=self.one('Down')
         with self.db: self.engine.prepare(second,NOW)
+        adapter.ambiguous=False
         self.engine.submit(second,NOW)
-        self.assertEqual(adapter.posts,1);self.assertIn('ambiguous',second['last_error'])
+        self.assertEqual(adapter.posts,2);self.assertEqual(second['state'],'LIVE')
+        reservations=self.engine.funds_reservations(NOW+100)
+        self.assertTrue(any(D(x['missing'])==D(i['committed_cost']) for x in reservations))
     def test_insufficient_funds_restart_then_credit_preserves_price(self):
         i=self.prepared();price=i['price'];adapter=self.live();adapter.available='0'
         self.engine.submit(i,NOW)
@@ -286,6 +291,24 @@ class TestEngine(unittest.TestCase):
         self.config.update(use_available_balance=True,balance_retry_seconds=7200,
             max_order_cost=None,max_total_committed_cost=None,max_daily_committed_cost=None,max_open_orders=None)
         return adapter
+    def test_unknown_cash_is_unavailable_to_other_orders(self):
+        i=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(i,NOW)
+        second=self.one('Down')
+        with self.db: self.engine.prepare(second,NOW)
+        adapter.ambiguous=False
+        adapter.funds=lambda intent,reservations,fee:{'available':str(max(D(0),D('3')-sum((D(x['missing'])+D(x['pending']) for x in reservations),D(0))))}
+        self.engine.submit(second,NOW+100)
+        self.assertEqual(adapter.posts,1);self.assertEqual(second['state'],'WAITING_FUNDS')
+    def test_five_minute_cash_pause_repeats_and_resumes(self):
+        i=self.prepared();adapter=self.balance_policy()
+        self.config['balance_retry_seconds']=300;adapter.available='0'
+        self.engine.submit(i,NOW)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+300)
+        self.engine.poll_paused_funds(NOW+300)
+        self.assertEqual(meta(self.db,'funds_retry_at'),NOW+600)
+        adapter.available='10';self.engine.poll_paused_funds(NOW+600)
+        self.assertEqual(meta(self.db,'funds_retry_at'),0)
     def test_balance_policy_without_fixed_caps_still_checks_cash(self):
         i=self.prepared();adapter=self.balance_policy();adapter.available='0'
         self.assertTrue(exposure_ok(self.db,i,self.config,NOW)[0])
@@ -647,6 +670,38 @@ class TestSDKOffline(unittest.TestCase):
         adapter=object.__new__(LiveAdapter)
         adapter.client=SimpleNamespace(get_order=lambda **kw:SimpleNamespace(asset_id='down',side='BUY'))
         with self.assertRaises(ValueError): adapter.reconcile({'order_id':'oid','token':'up'})
+    def test_missing_order_recovers_exact_confirmed_trade(self):
+        from execution import LiveAdapter
+        intent={'order_id':'oid','token':'up','condition':'condition','price':'.50','size':'5','committed_at':NOW}
+        trade=SimpleNamespace(id='fill',taker_order_id='oid',asset_id='up',side='BUY',
+                    size=D('5'),price=D('.49'),status='CONFIRMED',transaction_hash='tx')
+        other=SimpleNamespace(id='other',taker_order_id='elsewhere',maker_orders=[])
+        def unavailable(**kw): raise TimeoutError()
+        adapter=object.__new__(LiveAdapter)
+        adapter.client=SimpleNamespace(get_order=unavailable,
+            list_open_orders=lambda **kw:SimpleNamespace(iter_items=lambda:iter([])),
+            list_account_trades=lambda **kw:SimpleNamespace(iter_items=lambda:iter([other,trade])))
+        result=adapter.reconcile(intent)
+        self.assertEqual(result['status'],'FILLED');self.assertEqual(result['matched_qty'],'5')
+        self.assertEqual(len(result['fills']),1)
+    def test_empty_or_partial_history_never_proves_order_absent(self):
+        from execution import LiveAdapter
+        intent={'order_id':'oid','token':'up','condition':'condition','price':'.50','size':'5','committed_at':NOW}
+        adapter=object.__new__(LiveAdapter)
+        for qty in (None,D('2')):
+            trades=[] if qty is None else [SimpleNamespace(id='fill',taker_order_id='oid',asset_id='up',
+                side='BUY',size=qty,price=D('.5'),status='CONFIRMED',transaction_hash='tx')]
+            adapter.client=SimpleNamespace(list_account_trades=lambda **kw:SimpleNamespace(iter_items=lambda:iter(trades)))
+            self.assertEqual(adapter.reconcile_trades(intent)['status'],'UNKNOWN')
+    def test_history_cannot_accept_wrong_asset_or_excess_quantity(self):
+        from execution import LiveAdapter
+        intent={'order_id':'oid','token':'up','condition':'condition','price':'.50','size':'5','committed_at':NOW}
+        adapter=object.__new__(LiveAdapter)
+        for token,qty in [('down','5'),('up','6')]:
+            trade=SimpleNamespace(id='fill',taker_order_id='oid',asset_id=token,side='BUY',
+                size=D(qty),price=D('.5'),status='CONFIRMED',transaction_hash='tx')
+            adapter.client=SimpleNamespace(list_account_trades=lambda **kw:SimpleNamespace(iter_items=lambda:iter([trade])))
+            with self.assertRaises(ValueError): adapter.reconcile_trades(intent)
     def test_adapter_rejected_response_never_creates_position(self):
         from execution import LiveAdapter
         from polymarket.models.clob.order_response import RejectedOrder

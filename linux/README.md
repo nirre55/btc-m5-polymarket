@@ -75,7 +75,7 @@ imposé par son instance `@live`. Ne pas laisser les plafonds à null.
 Alternative explicitement choisie : `use_available_balance=true` permet de laisser
 ces quatre plafonds à null et d'ouvrir au minimum du marché tant que le solde lu,
 net des réservations et avec marge pour frais, suffit. En cas de manque, la pause
-commune est de deux heures (`balance_retry_seconds=7200`), persistante après reboot.
+commune est de cinq minutes (`balance_retry_seconds=300`), persistante après reboot.
 L'auto-redeem externe peut restituer des fonds ; le bot attend leur crédit réel.
 
 Dans `credentials.env`, décommenter volontairement la ligne :

@@ -182,7 +182,7 @@ def apply_reconciliation(db, i, result):
     i['matched_qty'] = str(matched)
     i['exchange_status'] = result['status']
     # Matched is not a confirmed position. Terminal order can still have pending trades.
-    save(db,i,'LIVE')
+    save(db,i,'UNKNOWN' if result['status']=='UNKNOWN' else 'LIVE')
     journal(db,i['id'],'RECONCILED',{'matched_qty':str(matched),'exchange_status':result['status']})
 
 
@@ -355,9 +355,9 @@ class Engine:
     def submit(self, i, now):
         if self.halted() or now+self.api.uncertainty>=i['opening']:
             return
-        if any(x['state'] in ('UNKNOWN','SENDING') for x in intents(self.db)):
-            i['last_error']='ambiguous_order_blocks_new_submissions'
-            save(self.db,i,next_check=now+30)
+        # An uncertain order keeps its own cash reservation. Never sign this
+        # intention again, but unrelated intentions may use the remaining cash.
+        if i['state'] not in ('PREPARED','WAITING_FUNDS'):
             return
         retry_at=meta(self.db,'funds_retry_at') or 0
         if self.config.get('use_available_balance') and now<retry_at:
