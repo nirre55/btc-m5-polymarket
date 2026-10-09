@@ -301,6 +301,10 @@ class TestEngine(unittest.TestCase):
         adapter.funds=lambda intent,reservations,fee:{'available':str(max(D(0),D('3')-sum((D(x['missing'])+D(x['pending']) for x in reservations),D(0))))}
         self.engine.submit(second,NOW+100)
         self.assertEqual(adapter.posts,1);self.assertEqual(second['state'],'WAITING_FUNDS')
+    def test_stale_book_retries_fresh_window_without_long_backoff(self):
+        i=self.prepared();i['attempts']=100
+        with self.db:self.engine.retry(i,'PublicDataError:stale or future book',NOW)
+        self.assertEqual(i['next_check'],NOW+15)
     def test_expired_unknown_releases_cash_after_terminal_reply_and_checks(self):
         i=self.prepared();adapter=self.live();adapter.ambiguous=True
         self.engine.submit(i,NOW);i['winner']='Down'

@@ -317,3 +317,6 @@ solde. L’état CLOSED_UNCONFIRMED conserve l’incertitude historique et inter
 toute nouvelle soumission ; il ne signifie pas « refus confirmé ». L’ordre reste
 suivi pour les fills tardifs. Un fill non confirmé rétablit la réservation. Une
 expiration seule ou des lectures indisponibles ne libèrent pas de fonds.
+
+Un carnet rejeté pour âge conserve la limite30s et déclenche un réessai15s,
+sans backoff exponentiel qui manquerait les fenêtres de fraîcheur.

@@ -225,6 +225,11 @@ class Engine:
             next_check=min(now+3600,last_chance) if last_chance>now else i['opening']
             save(self.db,i,next_check=next_check)
             return
+        if reason=='PublicDataError:stale or future book':
+            # Stable future books may refresh intermittently. A five-minute
+            # backoff can repeatedly miss the same 30-second freshness window.
+            save(self.db,i,next_check=now+15)
+            return
         delay = min(300,15*2**min(i['attempts']-1,5))
         # Other transient failures keep faster retries near imminent events.
         delay = min(delay,max(15,(i['opening']-now)/4)) if i['opening']>now else delay
@@ -400,6 +405,8 @@ class Engine:
             save(self.db,i,'WAITING_FUNDS',min(retry_at,i['opening']))
             return
         available=self.read_funds(i,now)
+        if i['state']=='WAITING_FUNDS' and available>=D(i['price'])*D(i['size'])*(1+D(self.config['fee_reserve_fraction'])):
+            i['state']='PREPARED'
         # Verify current constraints, but NEVER change the stored price.
         m=self.api.market(i['opening'])
         if not m or validate_market(m,i['opening'])[i['direction']]!=i['token'] or not m.get('acceptingOrders') or m.get('closed'):
