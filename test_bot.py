@@ -67,6 +67,7 @@ class FakeAdapter:
         if self.rejected: return {'ok':False,'order_id':None,'status':'REJECTED','trade_ids':[], 'retryable_funds':True}
         return {'ok':True,'order_id':'oid','status':'live','trade_ids':[]}
     def reconcile(self,i): return self.read
+    def cancel_expired_intent(self,i): return {'canceled':True,'terminal_acknowledged':True}
 
 
 class TestFrozen(unittest.TestCase):
@@ -300,6 +301,48 @@ class TestEngine(unittest.TestCase):
         adapter.funds=lambda intent,reservations,fee:{'available':str(max(D(0),D('3')-sum((D(x['missing'])+D(x['pending']) for x in reservations),D(0))))}
         self.engine.submit(second,NOW+100)
         self.assertEqual(adapter.posts,1);self.assertEqual(second['state'],'WAITING_FUNDS')
+    def test_expired_unknown_releases_cash_after_terminal_reply_and_checks(self):
+        i=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(i,NOW);i['winner']='Down'
+        adapter.read={'status':'UNKNOWN','matched_qty':'0','fills':[]}
+        self.api.t=OPEN+1300
+        with self.db:self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'CLOSED_UNCONFIRMED')
+        self.assertEqual(self.engine.funds_reservations(self.api.t),[])
+        self.engine.submit(i,self.api.t);self.assertEqual(adapter.posts,1)
+    def test_expiration_alone_never_releases_uncertain_cash(self):
+        i=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(i,NOW);i['winner']='Down'
+        adapter.read={'status':'UNKNOWN','matched_qty':'0','fills':[]}
+        adapter.cancel_expired_intent=lambda i:{'canceled':False,'terminal_acknowledged':False}
+        self.api.t=OPEN+1300
+        with self.db:self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'UNKNOWN')
+        self.assertTrue(self.engine.funds_reservations(self.api.t))
+    def test_canceled_unknown_waits_for_settlement_grace(self):
+        i=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(i,NOW);i['winner']='Down'
+        adapter.read={'status':'UNKNOWN','matched_qty':'0','fills':[]}
+        self.api.t=OPEN+600
+        with self.db:self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'UNKNOWN')
+    def test_cancel_failure_still_reconciles_confirmed_execution(self):
+        i=self.prepared();adapter=self.live();self.engine.submit(i,NOW)
+        def failed(i):raise TimeoutError()
+        adapter.cancel_expired_intent=failed
+        adapter.read={'status':'FILLED','matched_qty':'5','fills':[{'id':'fill','leg':'taker',
+            'qty':'5','price':i['price'],'status':'CONFIRMED'}]}
+        self.api.t=OPEN+1300
+        with self.db:self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'FILLED');self.assertEqual(position(self.db,i)['quantity'],'5')
+    def test_pending_settlement_keeps_cash_reserved(self):
+        i=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(i,NOW);i['winner']='Down'
+        adapter.read={'status':'UNKNOWN','matched_qty':'2','fills':[{'id':'fill','leg':'taker',
+            'qty':'2','price':i['price'],'status':'MINED'}]}
+        self.api.t=OPEN+1300
+        with self.db:self.engine.observe(i,self.api.t)
+        self.assertEqual(i['state'],'UNKNOWN');self.assertTrue(self.engine.funds_reservations(self.api.t))
     def test_five_minute_cash_pause_repeats_and_resumes(self):
         i=self.prepared();adapter=self.balance_policy()
         self.config['balance_retry_seconds']=300;adapter.available='0'

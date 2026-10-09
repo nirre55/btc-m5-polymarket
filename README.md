@@ -182,7 +182,7 @@ Une absence temporaire de réponse n'est ni un refus ni la preuve d'un ordre abs
 Une ambiguïté durable nécessite une inspection locale du compte et du journal.
 Si la lecture directe échoue, les ordres ouverts puis les transactions du marché
 sont consultés, avec correspondance exacte du hash. Un historique vide ou
-l’expiration ne prouvent jamais l’absence d’exécution ; la réservation reste conservée.
+l’expiration ne prouvent jamais l’absence d’exécution ; voir la clôture contrôlée ci-dessous.
 
 Le rapprochement lit l'ordre authentifié et les trades exacts associés, y compris
 les legs maker en cas d'exécution ultérieure. `matched_qty` n'est pas une position
@@ -303,3 +303,17 @@ non soumises sont recalculées avant signature ; les ordres déjà envoyés rest
 intacts. Exemple : maximum100 => cible3 ; solde97 => cible3 ; maximum200 => cible6.
 Modifier le pourcentage dans le config local et redémarrer le service conserve
 le maximum existant. Aucun plus haut solde historique n’est reconstruit.
+
+## Clôture des intentions à l’ouverture
+
+À l’ouverture, les ordres LIVE/UNKNOWN font l’objet d’une annulation par hash exact,
+jamais globale. Les fills exécutés sont conservés. Une erreur d’annulation ne
+supprime pas la réconciliation et ne bloque pas les autres intentions.
+
+Si un GTD reste illisible, la réservation peut être retirée après expiration+15min,
+résolution officielle, réponse d’annulation terminale (annulé ou déjà annulé/exécuté),
+historique authentifié complet sans règlement en attente et lecture fraîche du
+solde. L’état CLOSED_UNCONFIRMED conserve l’incertitude historique et interdit
+toute nouvelle soumission ; il ne signifie pas « refus confirmé ». L’ordre reste
+suivi pour les fills tardifs. Un fill non confirmé rétablit la réservation. Une
+expiration seule ou des lectures indisponibles ne libèrent pas de fonds.

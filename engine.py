@@ -128,7 +128,7 @@ def committed_risk(db, i, config):
     if not i.get('committed_cost') or i['state']=='REJECTED':
         return D(0)
     terminal = i['state'] in ('FILLED','CANCELED','CANCELLED','EXPIRED','INVALID',
-                             'CANCELED_MARKET_RESOLVED','PAPER_EXPIRED_REMAINDER')
+                             'CANCELED_MARKET_RESOLVED','PAPER_EXPIRED_REMAINDER','CLOSED_UNCONFIRMED')
     p = position(db,i)
     if not terminal or p['unconfirmed_trade_count'] or D(p['quantity'])!=D(i.get('matched_qty','0')):
         return D(i['committed_cost'])
@@ -292,7 +292,7 @@ class Engine:
                 continue
             p=position(self.db,x)
             pending=max(D(0),D(x.get('matched_qty','0'))-D(p['quantity']))
-            missing = D(x['committed_cost']) if x['state'] in ('LIVE','SENDING','UNKNOWN') or now-x['committed_at']<60 or p['unconfirmed_trade_count'] else D(0)
+            missing = D(x['committed_cost']) if (x['state'] in ('LIVE','SENDING','UNKNOWN') and not x.get('reservation_released_at')) or now-x['committed_at']<60 or p['unconfirmed_trade_count'] else D(0)
             if missing or pending:
                 reservations.append({'order_id':x['order_id'],'missing':str(missing),
                                      'pending':str(pending*D(x['price'])*reserve)})
@@ -463,7 +463,16 @@ class Engine:
         self.db.commit()
 
     def observe(self, i, now):
-        if i['state'] in ('LIVE','UNKNOWN'):
+        if i['state'] in ('LIVE','UNKNOWN','CLOSED_UNCONFIRMED'):
+            released=i.get('reservation_released_at')
+            if not released and now>=i['opening'] and not i.get('cancel_terminal_ack'):
+                try:
+                    cancellation=self.adapter.cancel_expired_intent(i)
+                    i['cancel_terminal_ack']=bool(cancellation['terminal_acknowledged'])
+                    journal(self.db,i['id'],'CANCEL_AT_OPENING',cancellation)
+                    save(self.db,i)
+                except Exception as exc:
+                    journal(self.db,i['id'],'CANCEL_READ_ERROR',{'error_type':type(exc).__name__})
             result=self.adapter.reconcile(i)
             apply_reconciliation(self.db,i,result)
             p=position(self.db,i)
@@ -473,6 +482,22 @@ class Engine:
                     i['state']='FILLED'
                 elif terminal in ('CANCELED','CANCELLED','EXPIRED','INVALID','CANCELED_MARKET_RESOLVED'):
                     i['state']=terminal
+            if released and i['state']=='UNKNOWN':
+                i['state']='CLOSED_UNCONFIRMED'
+            if (not released and i['state']=='UNKNOWN' and i.get('cancel_terminal_ack')
+                    and i['order_type']=='GTD' and now>=i['expiration']+900 and i.get('winner')
+                    and not p['unconfirmed_trade_count'] and D(p['quantity'])==D(i['matched_qty'])):
+                # Terminal reply + completed authenticated history + official
+                # resolution + fresh cash after settlement grace. Retire the
+                # cash reservation, without asserting this order never filled.
+                self.read_funds(i,now)
+                i.update(reservation_released_at=now,state='CLOSED_UNCONFIRMED',
+                         last_error='closed_without_complete_order_history')
+                journal(self.db,i['id'],'EXPIRED_RESERVATION_RELEASED',{
+                    'confirmed_qty':p['quantity'],'cancel_terminal_ack':True,
+                    'expiry':i['expiration'],'history_status':result['status']})
+                if meta(self.db,'funds_retry_at'):
+                    meta(self.db,'funds_retry_at',now)
         if now >= i['opening']+302 and not i.get('binance'):
             k=self.api.binance(i['opening'])
             if k and int(k[0][0])==i['opening']*1000 and int(k[0][6])<int(now*1000):
@@ -500,7 +525,7 @@ class Engine:
         self.poll_position_balance(now)
         all_intents=intents(self.db)
         due=[i for i in all_intents if i.get('next_check',0)<=now and
-             (not i.get('winner') or i['state'] in ('LIVE','UNKNOWN') or not i.get('binance'))]
+             (not i.get('winner') or i['state'] in ('LIVE','UNKNOWN','CLOSED_UNCONFIRMED') or not i.get('binance'))]
         # Reconcile committed capital before buying; available future slots first.
         due.sort(key=lambda i:(0 if i['state'] in ('LIVE','UNKNOWN') or (i.get('committed_cost') and not i.get('winner')) else 1 if i['opening']>now else 2,
                                i['opening'] if i['opening']>now else i.get('next_check',0)))

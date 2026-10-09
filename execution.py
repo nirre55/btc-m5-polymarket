@@ -184,6 +184,15 @@ class LiveAdapter:
                                           'transaction_hash':trade.transaction_hash})
         return {'status':order.status, 'matched_qty':str(order.size_matched), 'fills':fills}
 
+    def cancel_expired_intent(self, intent):
+        result=self.client.cancel_order(order_id=intent['order_id'])
+        canceled=intent['order_id'] in result.canceled
+        reason=result.not_canceled.get(intent['order_id'],'').lower()
+        # A terminal cancellation reply may say canceled OR fully matched.
+        # It proves no resting remainder, not zero historical execution.
+        terminal=canceled or ('already' in reason and 'cancel' in reason and 'matched' in reason)
+        return {'canceled':canceled,'terminal_acknowledged':terminal}
+
     def reconcile_trades(self, intent):
         """Recover fills by exact order identity, never infer absence from a scan."""
         fills=[]; seen=set()
