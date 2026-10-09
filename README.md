@@ -320,3 +320,13 @@ expiration seule ou des lectures indisponibles ne libèrent pas de fonds.
 
 Un carnet rejeté pour âge conserve la limite30s et déclenche un réessai15s,
 sans backoff exponentiel qui manquerait les fenêtres de fraîcheur.
+
+## Priorité chronologique stricte
+
+Toute intention future WAITING/PREPARED/WAITING_FUNDS plus proche interdit la
+signature des suivantes, même si son retry n’est pas encore dû, son carnet est
+stale ou son marché pas encore listé. Découverte et préparation des suivantes
+continuent. Une fois l’intention envoyée, abandonnée/refusée ou son ouverture
+passée, la suivante devient prioritaire. UNKNOWN ne bloque pas cette file :
+seul son coût reste réservé selon les règles de clôture. Aucun achat déjà
+exécuté n’est vendu ou modifié pour réordonner la file.

@@ -305,6 +305,28 @@ class TestEngine(unittest.TestCase):
         i=self.prepared();i['attempts']=100
         with self.db:self.engine.retry(i,'PublicDataError:stale or future book',NOW)
         self.assertEqual(i['next_check'],NOW+15)
+    def test_later_market_waits_for_earlier_even_if_earlier_not_due(self):
+        first=self.prepared();adapter=self.live()
+        later=dict(first,id=str(OPEN+300)+':Up',opening=OPEN+300,next_check=NOW)
+        with self.db:
+            save(self.db,first,'WAITING',NOW+3600)
+            self.db.execute('INSERT INTO intents VALUES (?,?,?,?,?,?)',
+                (later['id'],later['opening'],later['direction'],later['state'],json.dumps(later),NOW))
+        self.engine.submit(later,NOW)
+        self.assertEqual(adapter.signs,0);self.assertIn('waiting_for_earlier_market',later['last_error'])
+    def test_unknown_earlier_order_does_not_hold_chronological_queue(self):
+        first=self.prepared();adapter=self.live();adapter.ambiguous=True
+        self.engine.submit(first,NOW)
+        with self.db:save(self.db,self.one('Down'),'CONFLICT_SKIPPED')
+        later=dict(first,id=str(OPEN+300)+':Up',opening=OPEN+300,state='PREPARED')
+        for k in ['committed_at','committed_cost','order_id']:later.pop(k,None)
+        with self.db:
+            self.db.execute('INSERT INTO intents VALUES (?,?,?,?,?,?)',
+                (later['id'],later['opening'],later['direction'],later['state'],json.dumps(later),NOW))
+        adapter.ambiguous=False;self.api.market=lambda opening:market(opening)
+        self.engine.submit(later,NOW)
+        self.assertEqual(later['state'],'LIVE');self.assertEqual(adapter.posts,2)
+        self.assertNotIn('waiting_for_earlier_market',later.get('last_error') or '')
     def test_expired_unknown_releases_cash_after_terminal_reply_and_checks(self):
         i=self.prepared();adapter=self.live();adapter.ambiguous=True
         self.engine.submit(i,NOW);i['winner']='Down'
@@ -403,7 +425,9 @@ class TestEngine(unittest.TestCase):
     def test_global_two_hour_pause_survives_restart_and_repeats_then_resumes(self):
         i=self.prepared();i['opening']=NOW+20000
         self.api.m=market(i['opening']);self.api.market=lambda opening:self.api.m
-        with self.db: save(self.db,i)
+        with self.db:
+            save(self.db,i)
+            save(self.db,self.one('Down'),'CONFLICT_SKIPPED')
         adapter=self.balance_policy();calls=[]
         def funds(*args): calls.append(self.api.t);return {'available':adapter.available}
         adapter.funds=funds;adapter.available='0'
@@ -520,11 +544,11 @@ class TestEngine(unittest.TestCase):
                                 (i['id'],i['opening'],i['direction'],i['state'],json.dumps(i)))
                 self.engine.submit(i,NOW);queue.append(i)
         self.assertEqual(adapter.posts,10)
-        self.assertEqual(sum(i['state']=='WAITING_FUNDS' for i in queue),7)
+        self.assertEqual(sum(i['state'] in ('WAITING_FUNDS','PREPARED') for i in queue),7)
         cash[0]=D('19.25')  # externally credited cash, not theoretical winners
         with self.db:
             for i in queue:
-                if i['state']=='WAITING_FUNDS': self.engine.submit(i,NOW+30)
+                if i['state'] in ('WAITING_FUNDS','PREPARED'): self.engine.submit(i,NOW+30)
         self.assertEqual(adapter.posts,17)
         self.assertTrue(all(i['state']=='LIVE' for i in queue))
     def test_72_hour_horizon_and_absent_market_survives_restart(self):

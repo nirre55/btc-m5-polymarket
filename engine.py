@@ -399,6 +399,13 @@ class Engine:
         # intention again, but unrelated intentions may use the remaining cash.
         if i['state'] not in ('PREPARED','WAITING_FUNDS'):
             return
+        earlier=[x for x in intents(self.db) if now+self.api.uncertainty<x['opening']<i['opening']
+                 and x['state'] in ('WAITING','PREPARED','WAITING_FUNDS')]
+        if earlier:
+            first=min(earlier,key=lambda x:x['opening'])
+            i['last_error']='waiting_for_earlier_market:'+first['id']
+            save(self.db,i,next_check=now+15)
+            return
         retry_at=meta(self.db,'funds_retry_at') or 0
         if self.config.get('use_available_balance') and now<retry_at:
             i['last_error']='funds_pause_until_next_check'
